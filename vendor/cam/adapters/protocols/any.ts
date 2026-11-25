@@ -161,8 +161,8 @@ export function rewritePlatformRequest(platform: string, path: string, original:
   }
   try { saveRequestIndex(index, root); } catch { return asIs({ skipped: "request index could not be saved" }, session); }
   if (read.conversation) { try { markLatest(platform, session, root); } catch { /* a fetch then finds the session before */ } }
-  const copies = new Map(read.images.filter((image) => image.fetchedOf && image.turn < current).map((image) => [image.key, image.fetchedOf!]));
   const automatic = policy.auto !== false;
+  const copies = new Map(read.images.filter((image) => automatic && image.fetchedOf && image.turn < current).map((image) => [image.key, image.fetchedOf!]));
   const pinned = policy.pinnedContentIds ?? new Set<string>();
   const leaveOut = new Set(read.images.filter((image) => automatic && image.replaceable && !image.fetchedOf
     && image.turn < current && image.data !== null && ids.has(image.key) && !pinned.has(image.contentId)

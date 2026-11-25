@@ -12,13 +12,15 @@
     "scripts/configure-agents.js",
     "vendor/cam/",
     "panel/app.js",
-    "panel/index.html",
+    "panel/attachments.html",
+    "panel/icon.svg",
     "NOTICE.md"
   ],
   "engines": {
     "bun": ">=1.4"
   },
   "magpie": {
+    "icon": "https://raw.githubusercontent.com/zhaobomin/CAM-magpie/main/panel/icon.svg",
     "hooks": "./src/hooks.ts",
     "page": {
       "title": "Attachments",
@@ -26,7 +28,8 @@
         "zh": "上下文附件",
         "en": "Attachments"
       },
-      "file": "./panel/index.html"
+      "file": "./panel/attachments.html",
+      "icon": "panel/icon.svg"
     },
     "options": {
       "language": "zh",

@@ -1,5 +1,7 @@
 # Magpie CAM
 
+<img src="panel/icon.svg" alt="Magpie CAM" width="72" height="72">
+
 一个**纯 Magpie 插件**的上下文附件管理实现，参考并复用 Context Attachment Manager（CAM）0.13.1 的协议改写核心。
 
 > 已在 Magpie 0.1.4777 上部署，验证了 Codex 请求进入网关、附件索引更新及 MCP V2 短引用。当前版本的真实 Codex 聊天取图闭环仍待完整验收。
@@ -133,6 +135,18 @@ bun run configure:agents
 
 配置后，在 Claude Code 新开会话，通过 `/mcp` 确认 CAM 服务已连接。Codex 也可在工具列表中确认 `cam_view_image` 是否可用。
 
+### 扩展到其他 Agent
+
+在 CAM 面板打开 **设置**，可以按 Agent 控制自动省略旧图，并调整模型提示语言、单次取图张数和大小上限。升级后未单独设置的 Agent 保持原行为。关闭某个 Agent 的自动省略后，CAM 仍会索引图片；工具分配在 Magpie 的 Library → MCP 中管理。
+
+可以按 Magpie 的 Agent ID 追加分配。例如，为 OpenCode、Cline 和 Cursor 添加 CAM 工具，同时保留 Codex、Claude Code 和已有分配：
+
+```bash
+bun run configure:agents cam --agents opencode,cline,cursor
+```
+
+这一步只分配 MCP 工具。请先让目标客户端的模型请求经过 Magpie。插件的协议测试覆盖 OpenCode、Cline 和 Cursor 对应的合成请求，实际客户端仍需验证是否提供稳定会话 ID、声明 CAM 工具，以及是否原样传回工具结果。缺少稳定会话 ID 或工具声明时，CAM 保留历史原图。Gemini 原生协议仍只索引附件。
+
 本地目录安装时，Magpie 可能把工具命名为 `CAM-magpie_cam_view_image`；hub 和其他安装方式还会产生不同命名空间，插件会按实际声明动态适配。修改源码后使用 `magpie plugin off <路径>` 再 `on` 重载。
 
 **不要同时启用原版 CAM 的请求代理和本插件**。迁移时先在原版 CAM 中恢复直连并停用旧插件，再确认 Codex 上游指向 Magpie。
@@ -147,7 +161,7 @@ src/payload.ts         受校验的取图载荷及协议物化
 src/store.ts           会话、选择策略与原子持久化
 src/live-data.ts       原生页面静态 live.js 与缩略图发布
 src/session-titles.ts  Codex 原始标题与首条消息回退
-panel/index.html       选择面板
+panel/attachments.html  附件与设置面板
 vendor/cam/            CAM 0.13.1 核心及许可证
 tests/                 Bun 单元与端到端请求测试
 ```

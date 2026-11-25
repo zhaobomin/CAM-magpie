@@ -90,7 +90,7 @@ async function loadSessions(select) {
       const small = document.createElement("small");
       small.textContent = item.platform + " · " + date(item.lastSeen);
       button.append(strong, small);
-      button.onclick = () => loadDetail(item.key);
+      button.onclick = () => openSession(item.key);
       root.append(button);
     }
     const wanted = select || location.hash.slice(1) || sessions[0].key;
@@ -130,7 +130,7 @@ async function loadDetail(key) {
     const options = await readHostOptions();
     if (sequence !== detailSequence) return;
     if (!detail) throw new Error("会话不存在");
-    current = { ...detail, policy: options ? effectivePolicy(detail, options) : null };
+    current = { ...detail, policy: options ? effectivePolicy(detail, options) : null, agentPaused: options?.agentAuto?.[detail.session.platform] === false };
     location.hash = key;
     document.querySelectorAll(".session").forEach((el) => el.classList.toggle("active", el.dataset.key === key));
     renderDetail();
@@ -141,14 +141,14 @@ async function loadDetail(key) {
 
 function renderDetail() {
   if (!current) return;
-  const { session, policy, images } = current;
+  const { session, policy, images, agentPaused } = current;
   $("count").textContent = images.length;
   $("pinned").textContent = policy?.pinnedContentIds.length ?? "—";
   $("session-name").textContent = session.title || session.platform + " · " + session.key.slice(0, 8);
-  $("auto").checked = policy?.auto ?? false;
+  $("auto").checked = !agentPaused && (policy?.auto ?? false);
   $("auto").indeterminate = !policy;
-  $("auto").disabled = !policy || saving;
-  $("auto-help").textContent = policy ? "关闭后保留历史原图。新附件仍会被索引。" : "无法读取 Magpie 策略，刷新后可重试。";
+  $("auto").disabled = !policy || saving || agentPaused;
+  $("auto-help").textContent = agentPaused ? "此 Agent 已在插件设置中暂停自动省略。" : policy ? "关闭后保留历史原图。新附件仍会被索引。" : "无法读取 Magpie 策略，刷新后可重试。";
   const grid = $("grid");
   grid.replaceChildren();
   observer?.disconnect();
@@ -250,6 +250,64 @@ $("auto").onchange = (event) => {
   return save((policy) => ({ auto, pinnedContentIds: policy.pinnedContentIds }));
 };
 $("refresh").onclick = () => loadSessions(current?.session.key);
+
+function renderSettings(options) {
+  $("settings-fields").disabled = !options;
+  $("settings-status").textContent = options ? "" : "无法读取设置，请重新打开设置页重试。";
+  if (!options) return;
+  $("settings-language").value = options.language === "en" ? "en" : "zh";
+  $("settings-image-limit").value = Number.isInteger(options.maxFetchImages) ? Math.min(8, Math.max(1, options.maxFetchImages)) : 4;
+  $("settings-size-limit").value = Number.isInteger(options.maxFetchBytes) ? Math.min(33554432, Math.max(1024, options.maxFetchBytes)) : 12582912;
+  document.querySelectorAll("[data-agent]").forEach((input) => {
+    input.checked = options.agentAuto?.[input.dataset.agent] !== false;
+  });
+}
+
+function showSettings(visible) {
+  $("attachments").hidden = visible;
+  $("settings").hidden = !visible;
+  $("show-attachments").setAttribute("aria-pressed", String(!visible));
+  $("show-settings").setAttribute("aria-pressed", String(visible));
+  if (visible) {
+    $("settings-fields").disabled = true;
+    return readHostOptions().then(renderSettings);
+  }
+}
+
+function openSession(key) {
+  showSettings(false);
+  if (key) return loadDetail(key);
+}
+
+async function saveSettings(event) {
+  event.preventDefault();
+  if (saving || $("settings-fields").disabled || !$("settings-form").reportValidity()) return;
+  const agentChoices = Object.fromEntries([...document.querySelectorAll("[data-agent]")].map((input) => [input.dataset.agent, input.checked]));
+  const language = $("settings-language").value;
+  const maxFetchImages = $("settings-image-limit").valueAsNumber;
+  const maxFetchBytes = $("settings-size-limit").valueAsNumber;
+  saving = true;
+  $("settings-fields").disabled = true;
+  let latest;
+  try {
+    latest = await readHostOptions();
+    if (!latest) throw new Error("无法读取 Magpie 设置，请重试。");
+    const next = { ...latest, agentAuto: { ...latest.agentAuto, ...agentChoices }, language, maxFetchImages, maxFetchBytes };
+    const saved = await magpie.options.set(next);
+    if (current) current.agentPaused = (saved?.agentAuto ?? next.agentAuto)[current.session.platform] === false;
+    $("settings-status").textContent = "设置已保存。";
+  } catch (error) {
+    $("settings-status").textContent = error.message;
+  } finally {
+    $("settings-fields").disabled = !latest;
+    saving = false;
+    if (current) renderDetail();
+  }
+}
+
+$("show-settings").onclick = () => showSettings(true);
+$("show-attachments").onclick = () => openSession();
+$("settings-form").onsubmit = saveSettings;
 magpie.ready.then(async () => {
   await loadSessions();
 }).catch((error) => renderEmpty("Magpie 页面连接失败", String(error)));

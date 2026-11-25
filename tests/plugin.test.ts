@@ -27,6 +27,13 @@ beforeEach(() => { root = mkdtempSync(join(tmpdir(), "magpie-cam-")); });
 afterEach(() => { rmSync(root, { recursive: true, force: true }); });
 
 describe("Responses history management", () => {
+  test("an Agent override keeps old originals inline without disabling another Agent", async () => {
+    const request = body([user("first", [dataUrl()]), user("second")]);
+    const context = { ...ctx(), options: { ...options(), agentAuto: { codex: false } } };
+    expect(await onRequest(request, context)).toBeUndefined();
+    expect(texts(await onRequest(request, { ...context, agent: "opencode" }))).toContain("IMG-001");
+  });
+
   test("a unified host policy takes precedence over a future-dated legacy file", async () => {
     const key = keyFor("codex", "thread-test");
     savePolicy(root, key, { auto: true, pinnedContentIds: [], updatedAt: "2099-01-01T00:00:00.000Z", overridesLegacyNative: true });
@@ -260,6 +267,8 @@ describe("tool image round trip", () => {
     expect(texts(laterOutput)).not.toContain(dataUrl());
     expect(texts(laterOutput)).toContain("fetched original");
     expect(texts(laterOutput)).toContain("only in that turn");
+    const paused = await onRequest(later, { ...ctx(), options: { ...options(), agentAuto: { codex: false } } });
+    expect(paused.input.at(-2).output).toContainEqual({ type: "input_image", image_url: dataUrl() });
   });
 
   test("replays a legacy V1 payload and rejects changed bytes", async () => {

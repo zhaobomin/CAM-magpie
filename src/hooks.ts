@@ -103,7 +103,7 @@ export async function onRequest(body: Json, ctx: HookContext): Promise<Json | un
       options.language,
       // Omission requires both a stable session handle and a usable fetch tool.
       {
-        auto: policy.auto && !!toolName && !!named,
+        auto: policy.auto && !options.disabledAgents.has(platform) && !!toolName && !!named,
         pinnedContentIds: new Set(policy.pinnedContentIds),
         canFetch: (index, contentId, data) => {
           const seen = index.images.get(contentId);

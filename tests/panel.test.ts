@@ -7,6 +7,7 @@ import { createServer } from "node:http";
 import { createHash } from "node:crypto";
 import { createContext, runInContext } from "node:vm";
 import { onRequest } from "../src/hooks.ts";
+import { fetchImages } from "../src/tool.ts";
 import { createPanelServer, PageService } from "../src/panel-service.ts";
 import { writeLiveData } from "../src/live-data.ts";
 import { getPolicyWithOptions, keyFor, recordSession } from "../src/store.ts";
@@ -36,6 +37,65 @@ const panelKey = keyFor("codex", "panel-thread");
 const nativePolicies: Record<string, { auto: boolean; updatedAt?: string }> = {};
 
 describe("panel service", () => {
+  test("selecting a session from settings returns to the session view", async () => {
+    const source = readFileSync(new URL("../panel/app.js", import.meta.url), "utf8");
+    const nodes: Record<string, any> = {};
+    const environment = createContext({
+      document: { getElementById: (id: string) => (nodes[id] ??= { setAttribute() {} }) },
+      magpie: { ready: new Promise(() => {}) },
+    });
+    const selected = await runInContext(source + `
+      showSettings = (visible) => {
+        $("settings").hidden = !visible;
+        $("attachments").hidden = visible;
+      };
+      loadDetail = async (key) => key;
+      showSettings(true);
+      openSession("selected");
+    `, environment);
+    expect(selected).toBe("selected");
+    expect(nodes.settings.hidden).toBeTrue();
+    expect(nodes.attachments.hidden).toBeFalse();
+  });
+
+  test("settings save Agent overrides without overwriting unrelated host options", async () => {
+    const source = readFileSync(new URL("../panel/app.js", import.meta.url), "utf8");
+    const nodes: Record<string, any> = {
+      "settings-form": { reportValidity: () => true },
+      "settings-language": { value: "en" },
+      "settings-image-limit": { valueAsNumber: 2 },
+      "settings-size-limit": { valueAsNumber: 2048 },
+    };
+    const original = { dataDir: root, sessionPolicies: { other: { auto: false } }, agentAuto: { other: false } };
+    const writes: Record<string, unknown>[] = [];
+    const environment = createContext({
+      document: {
+        getElementById: (id: string) => (nodes[id] ??= {}),
+        querySelectorAll: () => [{ dataset: { agent: "opencode" }, checked: false }],
+      },
+      magpie: {
+        ready: new Promise(() => {}),
+        options: { get: async () => original, set: async (value: Record<string, unknown>) => { writes.push(value); return value; } },
+      },
+      setTimeout, clearTimeout,
+    });
+    await runInContext(source + "\nsaveSettings({ preventDefault() {} })", environment);
+    expect(writes).toEqual([{ ...original, agentAuto: { other: false, opencode: false }, language: "en", maxFetchImages: 2, maxFetchBytes: 2048 }]);
+    const user = (text: string, data?: string) => ({ type: "message", role: "user", content: [
+      { type: "input_text", text },
+      ...(data ? [{ type: "input_image", image_url: `data:image/png;base64,${data}` }] : []),
+    ] });
+    const request = { tools: [{ name: "cam_view_image" }], input: [user("first", PNG), user("second")] };
+    const context = { path: "/responses", protocol: "responses", origin: "local", session: "panel-thread", options: writes[0] };
+    expect(await onRequest(request, { ...context, agent: "opencode" })).toBeUndefined();
+    expect(JSON.stringify(await onRequest(request, { ...context, agent: "codex" }))).toContain("omitted");
+    const oversized = { ...request, input: [user("first", PNG.padEnd(2049, "A")), user("second")] };
+    expect(await onRequest(oversized, { ...context, agent: "codex" })).toBeUndefined();
+    const toolContext = { agent: "codex", abort: new AbortController().signal };
+    const response = await fetchImages({ session: panelKey, ids: ["IMG-001", "IMG-002", "IMG-003"] }, toolContext, writes[0]);
+    expect(response).toBe("Fetch at most 2 images at once.");
+  });
+
   test("shows attachments but prevents policy edits if the host cannot supply options", async () => {
     const source = readFileSync(new URL("../panel/app.js", import.meta.url), "utf8");
     const nodes: Record<string, any> = {};
