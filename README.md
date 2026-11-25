@@ -2,7 +2,7 @@
 
 一个**纯 Magpie 插件**的上下文附件管理实现，参考并复用 Context Attachment Manager（CAM）0.13.1 的协议改写核心。
 
-> 当前状态：已在本机 Magpie 0.1.4777 实装并通过真实网关验证；旧 Codex CAM 插件仅停用、未卸载。
+> 已在 Magpie 0.1.4777 上部署，验证了 Codex 请求进入网关、附件索引更新及 MCP V2 短引用。当前版本的真实 Codex 聊天取图闭环仍待完整验收。
 
 ## 它解决什么
 
@@ -43,7 +43,7 @@ Magpie gateway
 这是可工作的首版，不声称功能完全对齐：
 
 1. 使用 CAM 的通用请求索引，不读取 Codex rollout；因此尚未迁移原版 Codex 的特征行、逐出现位置手动勾选、fork 继承和 compaction 特化处理。
-2. Magpie 的工具传输目前只返回文本。本插件先把取图结果作为受校验的临时文本载荷交给客户端，再在下一次 `onRequest` 中物化为图片。无效或无法绑定会话的载荷会被移除。
+2. Magpie 的工具传输目前只返回文本。V2 取图结果传输会话、图片编号和内容哈希，下一次 `onRequest` 再从本地缓存读取原图，验证后物化为图片。缺失或损坏的原图会返回提示，同批其他有效图片仍可还原。旧会话中的 V1 内嵌图片载荷仍可读取。
 3. Magpie 工具上下文没有 `sessionID`。为避免跨会话取图，插件会在附件占位符旁写入 `[Magpie CAM session: …]`，调用 `cam_view_image` 时必须同时传回这个句柄；工具不会使用“最近会话”兜底。会话元数据、平台、图片编号和内容哈希都会再次校验。
 4. Responses / Chat / Anthropic 支持取图物化；Gemini 首版只建立索引，不自动省略，也不支持工具取图物化。只有请求明确声明 CAM 工具时才省略历史原图。Codex Lite 隐藏工具名时保留原图。
 5. 自动省略要求请求带有稳定会话 ID。没有 `ctx.session` 或可用 `client_metadata` 的匿名请求只建立索引，保留历史原图，不生成可取图占位符。
@@ -65,11 +65,11 @@ Magpie gateway
 - `sessions/`：面板所需的会话元数据；
 - `cache/pixels/`：像素哈希，不含图片内容。
 
-写入采用临时文件加原子替换。面板服务仅监听 `127.0.0.1`，默认端口 `17893`。持久附件和选择状态不会写入插件目录；原生页面所需的临时 `panel/live.js` 与缩略图是重新可生成的只读视图，已加入 `.gitignore`。
+写入采用临时文件加原子替换。持久附件和选择状态不会写入插件目录；临时 `panel/live.js` 与缩略图是重新可生成的只读视图，已加入 `.gitignore`。
 
 ## 原生与 Web 面板
 
-Magpie 原生插件页面禁止 inline script 和网络请求，因此原生模式通过外部 `app.js` 加载 `live.js` 与静态缩略图，并使用 `magpie.options` 保存会话选择；保存或宿主重载后通过 URL hash 保持当前会话。`magpie web` 模式继续使用 17893 的本地 service API。
+原生和 Web 面板都由 Magpie 宿主提供静态资源，共用 `live.js` 和缩略图，不占用独立端口。快照只包含附件视图和显式旧策略，面板显示时再读取宿主默认值。两种面板均通过 `magpie.options` 保存会话选择，宿主选项暂时不可读时仍可浏览附件。已有策略文件保留为兼容读取来源，该会话首次通过任一面板保存后，以宿主中的新版策略为准。保存或宿主重载后通过 URL hash 保持当前会话。
 
 ## 插件选项
 
@@ -83,7 +83,6 @@ Magpie 原生插件页面禁止 inline script 和网络请求，因此原生模�
 | `gatewayTimeoutMs` | `10000` | Magpie 异步 hook 超时 |
 | `maxFetchImages` | `4` | 单次最多取图数 |
 | `maxFetchBytes` | `12582912` | 单次取图 base64 字符预算 |
-| `panelPort` | `17893` | 面板本地服务端口 |
 | `dataDir` | 上述默认目录 | 独立数据目录 |
 
 ## 验证
@@ -95,7 +94,7 @@ bun test tests/*.test.ts
 bun build src/index.ts src/hooks.ts --target bun --outdir /tmp/magpie-cam-build
 ```
 
-当前验证结果：**40 tests passed，0 failed，118 assertions**，两个插件入口构建通过；另已通过真实 Magpie 网关的四轮 Responses 验证（索引 → 省略 → MCP 取图物化 → 下一轮副本省略）和原生窗口验证，详见 `docs/verification.md`。
+当前隔离验证为 **61 项测试通过**，两个插件入口构建通过。早期版本的真实网关和原生窗口验证见 `docs/verification.md`。
 
 测试覆盖：
 
@@ -108,17 +107,15 @@ bun build src/index.ts src/hooks.ts --target bun --outdir /tmp/magpie-cam-build
 
 ## 安装与重载
 
-本机已通过以下方式安装并分配给 Codex：
+从 GitHub 安装后，在 Magpie 的 Library → MCP 中将 CAM 工具分配给 Codex：
 
 ```bash
-magpie plugin add /path/to/CAM-magpie
-magpie library mcp agents CAM-magpie codex
-magpie library sync
+magpie plugin add github:zhaobomin/CAM-magpie
 ```
 
 本地目录安装时，Magpie 可能把工具命名为 `CAM-magpie_cam_view_image`；hub 和其他安装方式还会产生不同命名空间，插件会按实际声明动态适配。修改源码后使用 `magpie plugin off <路径>` 再 `on` 重载。
 
-**不要同时启用原版 CAM 的请求代理和本插件**。本机已用原版 CAM 的官方 `connectDirectly()` 恢复 Magpie 直连，并仅停用旧 Codex CAM 插件（未卸载）。重启 Codex 后可确保旧代理进程和旧工具完全退出。
+**不要同时启用原版 CAM 的请求代理和本插件**。迁移时先在原版 CAM 中恢复直连并停用旧插件，再确认 Codex 上游指向 Magpie。
 
 ## 目录
 
@@ -128,7 +125,6 @@ src/index.ts           Magpie 主入口（仅插件与页面服务导出）
 src/tool.ts            cam_view_image 取图实现
 src/payload.ts         受校验的取图载荷及协议物化
 src/store.ts           会话、选择策略与原子持久化
-src/panel-service.ts   Web 本地页面服务
 src/live-data.ts       原生页面静态 live.js 与缩略图发布
 src/session-titles.ts  Codex 原始标题与首条消息回退
 panel/index.html       选择面板

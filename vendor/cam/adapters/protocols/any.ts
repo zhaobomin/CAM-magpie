@@ -68,7 +68,7 @@ function readRequest(format: FormatName, json: Json): Read | null {
     const prompts: number[] = [];
     messages.forEach((message, msg) => {
       const content = message?.content;
-      const own = typeof content === "string" ? content.trim() !== "" : Array.isArray(content) && content.some((block: Json) => block?.type === "text" && String(block.text ?? "").trim() !== "");
+      const own = typeof content === "string" ? content.trim() !== "" : Array.isArray(content) && content.some((block: Json) => block?.type === "image" || (block?.type === "text" && String(block.text ?? "").trim() !== ""));
       if (message?.role === "user" && own && !(Array.isArray(content) && content.some((block: Json) => block?.type === "tool_result"))) prompts.push(msg);
     });
     const turnAt = (msg: number) => Math.max(prompts.filter((at) => at <= msg).length, 1);
@@ -78,7 +78,7 @@ function readRequest(format: FormatName, json: Json): Read | null {
       const fetchedOf = before?.type === "text" ? fetchedIdIn(String(before.text ?? "")) : null;
       return Object.assign(ref, { key: ref.key ?? `m${ref.msg}:p${ref.part}`, turn: turnAt(ref.msg), fetchedOf, data: String(ref.block.source.data) });
     });
-    const first = prompts.length ? textOfAnthropic(messages[prompts[0]].content) : "";
+    const first = prompts.map((msg) => textOfAnthropic(messages[msg].content)).find((text) => text.trim()) ?? "";
     return { images: refs, turns: Math.max(prompts.length, 1), first, conversation, rewrite: (describe, leaveOut, pixels, options) => {
       const out = rewriteBlocks(messages, refs as RequestImage[], describe as (ref: RequestImage) => Described | undefined, leaveOut, pixels as (ref: RequestImage) => string | null, options as never);
       return { body: { ...json, messages: out.messages }, report: out.report };
@@ -86,7 +86,7 @@ function readRequest(format: FormatName, json: Json): Read | null {
   }
   if (!Array.isArray(json.input)) return null;
   const items: Json[] = json.input;
-  const prompts = items.flatMap((item, at) => (item?.type === "message" && item.role === "user" && Array.isArray(item.content) && item.content.some((part: Json) => part?.type === "input_text" && String(part.text ?? "").trim() !== "") ? [at] : []));
+  const prompts = items.flatMap((item, at) => (item?.type === "message" && item.role === "user" && Array.isArray(item.content) && item.content.some((part: Json) => part?.type === "input_image" || (part?.type === "input_text" && String(part.text ?? "").trim() !== "")) ? [at] : []));
   const turnAt = (at: number) => Math.max(prompts.filter((prompt) => prompt <= at).length, 1);
   const refs = findImages(items);
   const dataOf = (ref: ImageRef): string | null => {
@@ -98,7 +98,7 @@ function readRequest(format: FormatName, json: Json): Read | null {
   };
   const images: AnyImage[] = refs.map((ref) => ({ ...ref, turn: turnAt(ref.item), fetchedOf: ref.fetchedId, data: dataOf(ref) }));
   const byKey = new Map(images.map((image) => [image.key, image]));
-  const first = prompts.length ? items[prompts[0]].content.filter((part: Json) => part?.type === "input_text").map((part: Json) => String(part.text)).join("\n") : "";
+  const first = prompts.map((at) => items[at].content.filter((part: Json) => part?.type === "input_text").map((part: Json) => String(part.text ?? "")).join("\n")).find((text) => text.trim()) ?? "";
   return { images, turns: Math.max(prompts.length, 1), first, conversation, rewrite: (describe, leaveOut, pixels, options) => {
     // The translator finds the images again; the same keys name them.
     const out = rewriteItems(items, (ref) => { const image = byKey.get(ref.key); return image ? describe(image) : undefined; }, leaveOut, (ref) => { const image = byKey.get(ref.key); return image ? pixels(image) : null; }, options);
@@ -107,6 +107,16 @@ function readRequest(format: FormatName, json: Json): Read | null {
 }
 
 const textOfAnthropic = (content: unknown): string => (typeof content === "string" ? content : Array.isArray(content) ? content.filter((block: Json) => block?.type === "text").map((block: Json) => String(block.text)).join("\n") : "");
+
+export function requestOriginals(path: string, body: Json): Map<string, string> {
+  const format = formatOf(path);
+  const originals = new Map<string, string>();
+  if (!format) return originals;
+  for (const image of readRequest(format, body)?.images ?? []) {
+    if (!image.fetchedOf && image.data !== null) originals.set(image.contentId, image.data);
+  }
+  return originals;
+}
 
 // The session a request belongs to: the one its headers name, else its first prompt (the same first prompt on the same
 // platform counts as the same session; ids go by content anyway).
@@ -119,7 +129,12 @@ export function sessionOfRequest(platform: string, named: string | null, first: 
 export type PlatformRewrite = { body: Buffer; report: Json; session: string | null };
 // Magpie adapter policy. The upstream CAM core always uses automatic selection;
 // these optional fields let the plugin pause it or pin content by digest.
-export type PlatformRewritePolicy = { auto?: boolean; pinnedContentIds?: ReadonlySet<string>; formatGeneratedText?: (text: string) => string };
+export type PlatformRewritePolicy = {
+  auto?: boolean;
+  pinnedContentIds?: ReadonlySet<string>;
+  canFetch?: (index: RequestIndex, contentId: string, data: string) => boolean;
+  formatGeneratedText?: (text: string) => string;
+};
 
 export function rewritePlatformRequest(platform: string, path: string, original: Buffer, encoding: string | undefined, named: string | null, root: string, lang: Lang, policy: PlatformRewritePolicy = {}): PlatformRewrite {
   const asIs = (report: Json, session: string | null = null): PlatformRewrite => ({ body: original, report, session });
@@ -144,12 +159,14 @@ export function rewritePlatformRequest(platform: string, path: string, original:
     const seen = remember(index, image, image.data, image.turn, root);
     ids.set(image.key, { id: seen.id, name: null, label: null, kind: image.kind, turn: image.turn, width: image.width, height: image.height });
   }
-  try { saveRequestIndex(index, root); } catch { /* the ids are given again next time */ }
+  try { saveRequestIndex(index, root); } catch { return asIs({ skipped: "request index could not be saved" }, session); }
   if (read.conversation) { try { markLatest(platform, session, root); } catch { /* a fetch then finds the session before */ } }
   const copies = new Map(read.images.filter((image) => image.fetchedOf && image.turn < current).map((image) => [image.key, image.fetchedOf!]));
   const automatic = policy.auto !== false;
   const pinned = policy.pinnedContentIds ?? new Set<string>();
-  const leaveOut = new Set(read.images.filter((image) => automatic && image.replaceable && !image.fetchedOf && image.turn < current && ids.has(image.key) && !pinned.has(image.contentId)).map((image) => image.key));
+  const leaveOut = new Set(read.images.filter((image) => automatic && image.replaceable && !image.fetchedOf
+    && image.turn < current && image.data !== null && ids.has(image.key) && !pinned.has(image.contentId)
+    && (policy.canFetch?.(index, image.contentId, image.data) ?? true)).map((image) => image.key));
   const out = read.rewrite((image) => ids.get(image.key), leaveOut, (image) => (image.data === null ? null : pixelHashOfData(image, image.data)), { lang, copies, auto: { currentTurn: current }, fetched: (image) => !!image.fetchedOf, formatGeneratedText: policy.formatGeneratedText });
   const { report } = out;
   const summary: Json = { format, auto: automatic, images: report.images, replaced: report.replaced.map(({ key: _key, ...rest }) => rest), sentImageHashes: report.sentContentIds.map((id) => id.slice(0, 16)), ...(report.copies.length ? { copies: report.copies } : {}) };

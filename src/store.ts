@@ -6,6 +6,7 @@ import { SESSION_KEY, sessionKeyOf } from "../vendor/cam/core/selection.ts";
 import { sessionTitle } from "./session-titles.ts";
 
 export type SessionPolicy = { auto: boolean; pinnedContentIds: string[]; updatedAt?: string; overridesLegacyNative?: boolean };
+type LegacyPolicy = Omit<SessionPolicy, "auto"> & { auto?: boolean };
 export type SessionInfo = {
   key: string;
   platform: string;
@@ -39,10 +40,15 @@ const policyFile = (root: string, key: string) => join(root, "policies", `${key}
 const sessionFile = (root: string, key: string) => join(root, "sessions", `${key}.json`);
 
 export function getPolicy(root: string, key: string, automatic = true): SessionPolicy {
-  if (!SESSION_KEY.test(key)) return { auto: automatic, pinnedContentIds: [] };
-  const value = readJson<Partial<SessionPolicy>>(policyFile(root, key), {});
+  const legacy = getLegacyPolicy(root, key);
+  return { ...legacy, auto: legacy.auto ?? automatic };
+}
+
+function getLegacyPolicy(root: string, key: string): LegacyPolicy {
+  if (!SESSION_KEY.test(key)) return { pinnedContentIds: [] };
+  const value = readJson<Partial<SessionPolicy> | null>(policyFile(root, key), null) ?? {};
   return {
-    auto: typeof value.auto === "boolean" ? value.auto : automatic,
+    ...(typeof value.auto === "boolean" ? { auto: value.auto } : {}),
     pinnedContentIds: Array.isArray(value.pinnedContentIds) ? [...new Set(value.pinnedContentIds.filter((id) => typeof id === "string" && DIGEST.test(id)))] : [],
     ...(typeof value.updatedAt === "string" ? { updatedAt: value.updatedAt } : {}),
     ...(value.overridesLegacyNative === true ? { overridesLegacyNative: true } : {}),
@@ -50,31 +56,21 @@ export function getPolicy(root: string, key: string, automatic = true): SessionP
 }
 
 export function getPolicyWithOptions(root: string, key: string, automatic = true, options?: Record<string, unknown>): SessionPolicy {
-  const base = getPolicy(root, key, automatic);
+  return resolvePolicy(getPolicy(root, key, automatic), key, options);
+}
+
+function resolvePolicy(base: SessionPolicy, key: string, options?: Record<string, unknown>): SessionPolicy {
   const table = options?.sessionPolicies;
   const candidate = table && typeof table === "object" && !Array.isArray(table) ? (table as Record<string, any>)[key] : null;
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return base;
   const nativeTime = typeof candidate.updatedAt === "string" ? Date.parse(candidate.updatedAt) : NaN;
   const fileTime = Date.parse(base.updatedAt ?? "");
-  if (Number.isFinite(nativeTime) ? fileTime >= nativeTime : base.overridesLegacyNative) return base;
+  if (candidate.version !== 2 && (Number.isFinite(nativeTime) ? fileTime >= nativeTime : base.overridesLegacyNative)) return base;
   return {
     auto: typeof candidate.auto === "boolean" ? candidate.auto : base.auto,
     pinnedContentIds: Array.isArray(candidate.pinnedContentIds) ? [...new Set(candidate.pinnedContentIds.filter((id: unknown) => typeof id === "string" && DIGEST.test(id)))] : base.pinnedContentIds,
     ...(Number.isFinite(nativeTime) ? { updatedAt: candidate.updatedAt } : {}),
   };
-}
-
-export function savePolicy(root: string, key: string, policy: SessionPolicy): SessionPolicy {
-  if (!SESSION_KEY.test(key)) throw new Error("invalid session");
-  const previous = Date.parse(policy.updatedAt ?? "") || 0;
-  const next = {
-    auto: policy.auto !== false,
-    pinnedContentIds: [...new Set(policy.pinnedContentIds.filter((id) => DIGEST.test(id)))],
-    updatedAt: new Date(Math.max(Date.now(), previous + 1)).toISOString(),
-    ...(policy.overridesLegacyNative ? { overridesLegacyNative: true } : {}),
-  };
-  atomicJson(policyFile(root, key), next);
-  return next;
 }
 
 export function recordSession(root: string, value: Omit<SessionInfo, "firstSeen" | "lastSeen"> & { at?: string; titleSource?: "index" | "query" | null }): void {
@@ -112,7 +108,8 @@ export function getSession(root: string, key: string): SessionInfo | null {
 export function sessionDetail(root: string, key: string, automatic = true, options?: Record<string, unknown>) {
   const session = getSession(root, key);
   if (!session) return null;
-  const policy = getPolicyWithOptions(root, key, automatic, options);
+  const legacyPolicy = getLegacyPolicy(root, key);
+  const policy = resolvePolicy({ ...legacyPolicy, auto: legacyPolicy.auto ?? automatic }, key, options);
   const pinned = new Set(policy.pinnedContentIds);
   const index = openRequestIndex(session.platform, key, root);
   const images = [...index.images.entries()].map(([contentId, seen]) => {
@@ -120,7 +117,7 @@ export function sessionDetail(root: string, key: string, automatic = true, optio
     try { storedChars = statSync(join(root, "platforms", session.platform, "images", contentId)).size; } catch { /* gone */ }
     return { contentId, ...seen, pinned: pinned.has(contentId), stored: storedChars > 0 };
   }).sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true }));
-  return { session, policy, images };
+  return { session, policy, legacyPolicy, images };
 }
 
 export function imageForPanel(root: string, key: string, id: string): { mime: string; data: string } | null {

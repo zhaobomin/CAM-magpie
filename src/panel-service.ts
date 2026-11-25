@@ -3,11 +3,11 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { join } from "node:path";
 import { writeLiveData } from "./live-data.ts";
 import { resolveOptions } from "./options.ts";
-import { getSession, imageForPanel, listSessions, savePolicy, sessionDetail } from "./store.ts";
+import { getSession, imageForPanel, listSessions, sessionDetail } from "./store.ts";
 
 const PANEL_DIR = join(import.meta.dirname, "..", "panel");
 const PANEL_HTML = join(PANEL_DIR, "index.html");
-const JSON_LIMIT = 64 * 1024;
+const localServices = new Map<number, (options: Record<string, unknown>) => void>();
 
 function loopbackHost(value: string | undefined): boolean {
   if (!value) return false;
@@ -42,22 +42,10 @@ function send(res: ServerResponse, status: number, value: unknown, type = "appli
   res.end(body);
 }
 
-async function jsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    size += chunk.length;
-    if (size > JSON_LIMIT) throw new Error("request too large");
-    chunks.push(chunk);
-  }
-  const value = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid JSON");
-  return value;
-}
-
-export function createPanelServer(rawOptions: Record<string, unknown> = {}) {
-  const options = resolveOptions(rawOptions);
-  return createServer(async (req, res) => {
+export function createPanelServer(initialOptions: Record<string, unknown> = {}) {
+  let config = { rawOptions: initialOptions, options: resolveOptions(initialOptions) };
+  const server = createServer(async (req, res) => {
+    const { rawOptions, options } = config;
     try {
       if (!trustedRequest(req)) {
         send(res, 403, { error: "forbidden" });
@@ -72,7 +60,7 @@ export function createPanelServer(rawOptions: Record<string, unknown> = {}) {
         send(res, 200, readFileSync(join(PANEL_DIR, url.pathname.slice(1)), "utf8"), "text/javascript; charset=utf-8");
         return;
       }
-      const imageFile = /^\/images\/([0-9a-f-]+)\/(IMG-\d{3,}\.(?:png|jpg|gif|webp))$/.exec(url.pathname);
+      const imageFile = /^\/images\/([0-9a-f-]+)\/(IMG-\d{3,}(?:-[0-9a-f]{64})?\.(?:png|jpg|gif|webp))$/.exec(url.pathname);
       if (req.method === "GET" && imageFile) {
         const mime = imageFile[2].endsWith(".jpg") ? "image/jpeg" : imageFile[2].endsWith(".gif") ? "image/gif" : imageFile[2].endsWith(".webp") ? "image/webp" : "image/png";
         send(res, 200, readFileSync(join(PANEL_DIR, "images", imageFile[1], imageFile[2])), mime);
@@ -97,18 +85,7 @@ export function createPanelServer(rawOptions: Record<string, unknown> = {}) {
         return;
       }
       if (req.method === "PUT" && match[2] === "policy") {
-        const body = await jsonBody(req);
-        const current = sessionDetail(options.dataDir, key, options.auto, rawOptions);
-        const pinned = Array.isArray(body.pinnedContentIds) ? body.pinnedContentIds.map(String) : current?.policy.pinnedContentIds ?? [];
-        const valid = new Set(current?.images.map((image) => image.contentId) ?? []);
-        const policy = savePolicy(options.dataDir, key, {
-          auto: typeof body.auto === "boolean" ? body.auto : current?.policy.auto ?? options.auto,
-          pinnedContentIds: pinned.filter((id) => valid.has(id)),
-          updatedAt: current?.policy.updatedAt,
-          overridesLegacyNative: true,
-        });
-        try { writeLiveData(options.dataDir, true, options.auto); } catch { /* keep the API response */ }
-        send(res, 200, { policy });
+        send(res, 405, { error: "Save attachment policies through Magpie's plugin options." });
         return;
       }
       if (req.method === "GET" && match[2]?.startsWith("images/")) {
@@ -122,24 +99,38 @@ export function createPanelServer(rawOptions: Record<string, unknown> = {}) {
       send(res, 400, { error: error instanceof Error ? error.message : "bad request" });
     }
   });
+  const updateOptions = (rawOptions: Record<string, unknown>) => {
+    config = { rawOptions, options: resolveOptions(rawOptions) };
+  };
+  server.on("listening", () => {
+    const address = server.address();
+    if (!address || typeof address === "string" || address.address !== "127.0.0.1") return;
+    localServices.set(address.port, updateOptions);
+    server.once("close", () => {
+      if (localServices.get(address.port) === updateOptions) localServices.delete(address.port);
+    });
+  });
+  return server;
 }
 
 export const PageService = async (_input: unknown, options: Record<string, unknown> = {}) => {
   const resolved = resolveOptions(options);
-  writeLiveData(resolved.dataDir, true, resolved.auto);
+  writeLiveData(resolved.dataDir, true);
+  const existing = localServices.get(resolved.panelPort);
+  if (existing) {
+    existing(options);
+    return {};
+  }
   const server = createPanelServer(options);
   await new Promise<void>((resolve, reject) => {
-    server.once("error", async (error: NodeJS.ErrnoException) => {
-      if (error.code === "EADDRINUSE") {
-        try {
-          const response = await fetch(`http://127.0.0.1:${resolved.panelPort}/api/health`, { signal: AbortSignal.timeout(1500) });
-          const health = await response.json();
-          // A plugin reload may leave the previous host's service alive for a
-          // moment. Reuse only our own healthy service, never another app's port.
-          if (health?.service === "magpie-cam") return resolve();
-        } catch { /* another service, or one that is shutting down */ }
+    server.once("error", (error: NodeJS.ErrnoException) => {
+      const concurrent = error.code === "EADDRINUSE" && localServices.get(resolved.panelPort);
+      if (concurrent) {
+        concurrent(options);
+        resolve();
+      } else {
+        reject(error);
       }
-      reject(error);
     });
     server.listen(resolved.panelPort, "127.0.0.1", resolve);
   });

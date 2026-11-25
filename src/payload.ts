@@ -1,29 +1,83 @@
-import { createHash } from "node:crypto";
-import { openRequestIndex } from "../vendor/cam/core/request-index.ts";
+import type { Lang } from "../vendor/cam/core/lang.ts";
+import { openRequestIndex, readImageContent } from "../vendor/cam/core/request-index.ts";
+import { fetchedLabel } from "../vendor/cam/core/words.ts";
+import { IMAGE_ID, isFetchImage, retrievableImage, verifiedContentId, MAX_FETCH_CHARS, type FetchImage } from "./retrieval.ts";
 
 export const PAYLOAD_PREFIX = "MAGPIE_CAM_IMAGE_PAYLOAD_V1:";
-const MAX_PAYLOAD_CHARS = 32 * 1024 * 1024;
+export const REFERENCE_PREFIX = "MAGPIE_CAM_IMAGE_PAYLOAD_V2:";
+const MAX_REFERENCE_CHARS = 64 * 1024;
+const MAX_TEXT_CHARS = 16_384;
+const MAX_PARTS = 17;
+const MAX_WIRE_CHARS = MAX_FETCH_CHARS + PAYLOAD_PREFIX.length + MAX_PARTS * (MAX_TEXT_CHARS * 6 + 256);
 
 type TextContent = { type: "text"; text: string };
-type ImageContent = { type: "image"; id: string; data: string; mimeType: string };
-export type PayloadContent = TextContent | ImageContent;
+export type PayloadContent = TextContent | FetchImage;
 type Payload = { version: 1; content: PayloadContent[] };
+type ImageReference = { type: "image_ref"; id: string; contentId: string };
+export type ReferenceContent = TextContent | ImageReference;
+type FindRequestOriginal = (contentId: string) => string | undefined;
 
-const text = (value: unknown): value is TextContent => !!value && typeof value === "object" && (value as PayloadContent).type === "text" && typeof (value as TextContent).text === "string" && (value as TextContent).text.length <= 16_384;
-const image = (value: unknown): value is ImageContent => !!value && typeof value === "object" && (value as PayloadContent).type === "image"
-  && /^IMG-\d{3,}$/.test(String((value as ImageContent).id)) && /^image\/[a-z0-9.+-]+$/i.test(String((value as ImageContent).mimeType))
-  && typeof (value as ImageContent).data === "string" && (value as ImageContent).data.length > 0 && (value as ImageContent).data.length <= MAX_PAYLOAD_CHARS;
+const text = (value: unknown): value is TextContent => !!value && typeof value === "object" && (value as PayloadContent).type === "text" && typeof (value as TextContent).text === "string" && (value as TextContent).text.length <= MAX_TEXT_CHARS;
 
-export function encodePayload(content: PayloadContent[]): string {
-  return PAYLOAD_PREFIX + JSON.stringify({ version: 1, content });
+export function encodeReferences(session: string, language: Lang, content: ReferenceContent[]): string {
+  return REFERENCE_PREFIX + JSON.stringify({ version: 2, session, language, content });
+}
+
+function isPayload(value: string): boolean {
+  return value.startsWith(PAYLOAD_PREFIX) || value.startsWith(REFERENCE_PREFIX);
+}
+
+function reference(value: unknown): value is ImageReference {
+  if (!value || typeof value !== "object") return false;
+  const part = value as Partial<ImageReference>;
+  return part.type === "image_ref" && typeof part.id === "string" && IMAGE_ID.test(part.id)
+    && typeof part.contentId === "string" && /^[0-9a-f]{64}$/.test(part.contentId);
+}
+
+function resolveReferences(value: string, platform: string, session: string, root: string, findOriginal?: FindRequestOriginal): PayloadContent[] | null {
+  if (value.length > MAX_REFERENCE_CHARS) return null;
+  try {
+    const parsed = JSON.parse(value.slice(REFERENCE_PREFIX.length));
+    if (parsed?.version !== 2 || parsed.session !== session || (parsed.language !== "zh" && parsed.language !== "en")) return null;
+    const content = parsed.content as ReferenceContent[];
+    if (!Array.isArray(content) || content.length > 8 || !content.every((part) => text(part) || reference(part))) return null;
+    const index = openRequestIndex(platform, session, root);
+    const result: PayloadContent[] = [];
+    let remaining = MAX_FETCH_CHARS;
+    for (const part of content) {
+      if (part.type === "text") {
+        result.push(part);
+        continue;
+      }
+      const seen = index.images.get(part.contentId);
+      const verify = (data: string | null | undefined): FetchImage | null => {
+        if (!data || !seen) return null;
+        const image: FetchImage = { type: "image", id: part.id, data, mimeType: seen.mime ?? "image/png" };
+        return verifiedContentId(index, image, remaining) === part.contentId ? image : null;
+      };
+      const image = seen?.id === part.id
+        ? verify(readImageContent(root, platform, part.contentId)) ?? verify(findOriginal?.(part.contentId))
+        : null;
+      if (!image || !seen) {
+        result.push({ type: "text", text: parsed.language === "en" ? `${part.id}: original unavailable; upload it again.` : `${part.id}：原图不可用，请重新上传。` });
+        continue;
+      }
+      remaining -= image.data.length;
+      result.push(
+        { type: "text", text: fetchedLabel({ id: part.id, name: null, label: null, kind: seen.kind, turn: seen.turn, width: seen.width, height: seen.height }, parsed.language) },
+        image,
+      );
+    }
+    return result;
+  } catch { return null; }
 }
 
 function decode(value: string): Payload | null {
-  if (!value.startsWith(PAYLOAD_PREFIX) || value.length > MAX_PAYLOAD_CHARS + PAYLOAD_PREFIX.length + 1024) return null;
+  if (!value.startsWith(PAYLOAD_PREFIX) || value.length > MAX_WIRE_CHARS) return null;
   try {
     const parsed = JSON.parse(value.slice(PAYLOAD_PREFIX.length));
-    if (parsed?.version !== 1 || !Array.isArray(parsed.content) || parsed.content.length > 17) return null;
-    if (!parsed.content.every((part: unknown) => text(part) || image(part))) return null;
+    if (parsed?.version !== 1 || !Array.isArray(parsed.content) || parsed.content.length > MAX_PARTS) return null;
+    if (!parsed.content.every((part: unknown) => text(part) || isFetchImage(part))) return null;
     return parsed;
   } catch { return null; }
 }
@@ -33,17 +87,19 @@ function decode(value: string): Payload | null {
 function trusted(payload: Payload, platform: string, session: string, root: string): Payload | null {
   try {
     const index = openRequestIndex(platform, session, root);
+    let remaining = MAX_FETCH_CHARS;
     for (const part of payload.content) {
       if (part.type !== "image") continue;
-      const match = [...index.images.entries()].find(([contentId, seen]) => seen.id === part.id && createHash("sha256").update(part.data).digest("hex") === contentId);
-      if (!match || (match[1].mime && match[1].mime !== part.mimeType)) return null;
+      if (!retrievableImage(index, part, remaining)) return null;
+      remaining -= part.data.length;
     }
     return payload;
   } catch { return null; }
 }
 
-function materialized(value: unknown, platform: string, session: string | null, root: string): PayloadContent[] | null {
+function materialized(value: unknown, platform: string, session: string | null, root: string, findOriginal?: FindRequestOriginal): PayloadContent[] | null {
   if (typeof value !== "string" || !session) return null;
+  if (value.startsWith(REFERENCE_PREFIX)) return resolveReferences(value, platform, session, root, findOriginal);
   const payload = decode(value);
   return payload ? trusted(payload, platform, session, root)?.content ?? null : null;
 }
@@ -72,7 +128,7 @@ export function redactPayloadsEverywhere(value: unknown): { value: any; count: n
   let count = 0;
   const visit = (input: unknown): any => {
     if (typeof input === "string") {
-      if (!input.startsWith(PAYLOAD_PREFIX)) return input;
+      if (!isPayload(input)) return input;
       count++;
       return "[Magpie CAM: image payload dropped after a processing error]";
     }
@@ -87,21 +143,21 @@ export type MaterializeResult = { body: Record<string, any>; count: number };
 
 // Only tool-output positions are inspected. A user message containing the same
 // prefix can never manufacture an image or enter the fetched-copy path.
-export function materializeToolPayloads(original: Record<string, any>, protocol: string, platform: string, session: string | null, root: string): MaterializeResult {
+export function materializeToolPayloads(original: Record<string, any>, protocol: string, platform: string, session: string | null, root: string, findOriginal?: FindRequestOriginal): MaterializeResult {
   let count = 0;
   const body = structuredClone(original);
   const convert = (holder: Record<string, any>, key: string, parts: (content: PayloadContent[]) => unknown) => {
     const original = holder[key];
     const raw = typeof original === "string" ? original : Array.isArray(original) && original.length === 1 && ["text", "input_text", "output_text"].includes(original[0]?.type) && typeof original[0]?.text === "string" ? original[0].text : null;
-    if (!raw?.startsWith(PAYLOAD_PREFIX)) {
-      const split = Array.isArray(original) && original.some((part) => typeof part?.text === "string" && part.text.startsWith(PAYLOAD_PREFIX));
+    if (!raw || !isPayload(raw)) {
+      const split = Array.isArray(original) && original.some((part) => typeof part?.text === "string" && isPayload(part.text));
       if (split) {
         holder[key] = parts([{ type: "text", text: "[Magpie CAM: split or mixed image payload removed]" }]);
         count++;
       }
       return;
     }
-    const content = materialized(raw, platform, session, root) ?? [{ type: "text" as const, text: "[Magpie CAM: unavailable or untrusted image payload removed]" }];
+    const content = materialized(raw, platform, session, root, findOriginal) ?? [{ type: "text" as const, text: "[Magpie CAM: unavailable or untrusted image payload removed]" }];
     // Never forward an encoded payload as prompt text, even when validation
     // fails or the client supplied no stable session identity.
     holder[key] = parts(content);

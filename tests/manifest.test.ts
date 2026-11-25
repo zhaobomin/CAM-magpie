@@ -1,20 +1,20 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import * as entry from "../src/index.ts";
-import { CamPlugin, PageService } from "../src/index.ts";
+import { CamPlugin } from "../src/index.ts";
 
 const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 
 describe("Magpie package contract", () => {
-  test("declares request hooks, a tool-capable main module and a page service", async () => {
+  test("declares request hooks, a tool-capable main module and a port-free page", async () => {
     expect(manifest.name).toBe("@magpie-community/cam");
     expect(manifest.magpie.hooks).toBe("./src/hooks.ts");
-    expect(manifest.magpie.page.service.option).toBe("panelPort");
+    expect(manifest.magpie.page.service).toBeUndefined();
     expect(manifest.dependencies).toBeUndefined();
     const plugin = await CamPlugin({}, {});
     expect(plugin.tool.cam_view_image.description).toContain("omitted");
     expect(plugin.tool.cam_view_image.args.required).toEqual(["ids", "session"]);
-    expect(PageService).toBeFunction();
+    expect(Object.keys(entry).sort()).toEqual(["CamPlugin", "default"]);
     // Helper exports are mistaken for plugin entries by Magpie's loader.
     expect(entry.fetchImages).toBeUndefined();
   });

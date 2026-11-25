@@ -43,10 +43,6 @@ export function openRequestIndex(platform: string, key: string, root: string): R
 // `data` is raw base64.
 export function remember(index: RequestIndex, image: { contentId: string; mime: string | null; kind: ImageKind; width: number | null; height: number | null }, data: string, turn: number, root: string): Seen {
   const known = index.images.get(image.contentId);
-  if (known) return known;
-  const seen: Seen = { id: `IMG-${String(index.images.size + 1).padStart(3, "0")}`, mime: image.mime, turn, kind: image.kind, width: image.width, height: image.height };
-  index.images.set(image.contentId, seen);
-  index.changed = true;
   if (CONTENT_ID.test(image.contentId)) {
     const dir = join(platformDirOf(root, index.platform), "images");
     const file = join(dir, image.contentId);
@@ -55,6 +51,10 @@ export function remember(index: RequestIndex, image: { contentId: string; mime: 
       writeWhole(file, data);
     }
   }
+  if (known) return known;
+  const seen: Seen = { id: `IMG-${String(index.images.size + 1).padStart(3, "0")}`, mime: image.mime, turn, kind: image.kind, width: image.width, height: image.height };
+  index.images.set(image.contentId, seen);
+  index.changed = true;
   return seen;
 }
 
@@ -67,12 +67,15 @@ export function saveRequestIndex(index: RequestIndex, root: string): void {
 }
 
 // An image by its id: what is known of it and its base64 data (null once its file is gone).
+export function readImageContent(root: string, platform: string, contentId: string): string | null {
+  if (!CONTENT_ID.test(contentId)) return null;
+  try { return readFileSync(join(platformDirOf(root, platform), "images", contentId), "utf8"); } catch { return null; }
+}
+
 export function seenImage(index: RequestIndex, id: string, root: string): { seen: Seen; data: string | null } | null {
   for (const [contentId, seen] of index.images) {
     if (seen.id !== id) continue;
-    let data: string | null = null;
-    try { data = CONTENT_ID.test(contentId) ? readFileSync(join(platformDirOf(root, index.platform), "images", contentId), "utf8") : null; } catch { /* gone */ }
-    return { seen, data };
+    return { seen, data: readImageContent(root, index.platform, contentId) };
   }
   return null;
 }

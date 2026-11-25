@@ -1,10 +1,12 @@
 import { join } from "node:path";
-import { formatOf, rewritePlatformRequest } from "../vendor/cam/adapters/protocols/any.ts";
+import { formatOf, requestOriginals, rewritePlatformRequest } from "../vendor/cam/adapters/protocols/any.ts";
 import { hasUnsafeInteger } from "../vendor/cam/core/engine/transport.ts";
 import { setPixelCache } from "../vendor/cam/core/pixels.ts";
+import { readImageContent } from "../vendor/cam/core/request-index.ts";
 import { writeLiveData } from "./live-data.ts";
 import { resolveOptions, type CamOptions } from "./options.ts";
 import { annotateFetchText, materializeToolPayloads, redactPayloadsEverywhere } from "./payload.ts";
+import { retrievableImage } from "./retrieval.ts";
 import { sessionTitle } from "./session-titles.ts";
 import { getPolicyWithOptions, keyFor, recordSession } from "./store.ts";
 
@@ -84,7 +86,9 @@ export async function onRequest(body: Json, ctx: HookContext): Promise<Json | un
   let safeBody = body;
   let materializedCount = 0;
   try {
-    const materialized = materializeToolPayloads(body, ctx.protocol ?? "", platform, session, options.dataDir);
+    let originals: Map<string, string> | undefined;
+    const materialized = materializeToolPayloads(body, ctx.protocol ?? "", platform, session, options.dataDir,
+      (contentId) => (originals ??= requestOriginals(path, body)).get(contentId));
     safeBody = materialized.body;
     materializedCount = materialized.count;
     const policy = session ? getPolicyWithOptions(options.dataDir, session, options.auto, ctx.options) : { auto: options.auto, pinnedContentIds: [] };
@@ -101,9 +105,15 @@ export async function onRequest(body: Json, ctx: HookContext): Promise<Json | un
       {
         auto: policy.auto && !!toolName && !!named,
         pinnedContentIds: new Set(policy.pinnedContentIds),
+        canFetch: (index, contentId, data) => {
+          const seen = index.images.get(contentId);
+          return !!seen && retrievableImage(index, { type: "image", id: seen.id, data, mimeType: seen.mime ?? "image/png" }, options.maxFetchBytes, contentId)
+            && readImageContent(options.dataDir, platform, contentId) === data;
+        },
         formatGeneratedText: session && toolName ? (text) => annotateFetchText(text, session, toolName) : undefined,
       },
     );
+    const replaced = Array.isArray(rewritten.report.replaced) ? rewritten.report.replaced.length : 0;
     if (rewritten.session && named) {
       try {
         recordSession(options.dataDir, {
@@ -114,10 +124,11 @@ export async function onRequest(body: Json, ctx: HookContext): Promise<Json | un
           model: ctx.model ?? String(body.model ?? ""),
           ...sessionTitle(platform, named, ctx.query),
         });
-      } catch { /* panel metadata is best-effort; request rewriting still stands */ }
-      try { writeLiveData(options.dataDir, false, options.auto); } catch { /* static panel data is best-effort too */ }
+      } catch (error) {
+        if (replaced) throw error;
+      }
+      try { writeLiveData(options.dataDir); } catch { /* static panel data is best-effort too */ }
     }
-    const replaced = Array.isArray(rewritten.report.replaced) ? rewritten.report.replaced.length : 0;
     const copies = Array.isArray(rewritten.report.copies) ? rewritten.report.copies.length : 0;
     ctx.state && (ctx.state.cam = { session: rewritten.session, replaced, copies, materialized: materialized.count });
     ctx.report?.(replaced || copies || materialized.count ? "ready" : "skipped", replaced + copies + materialized.count);

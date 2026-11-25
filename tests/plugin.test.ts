@@ -1,12 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { onRequest } from "../src/hooks.ts";
 import { fetchImages } from "../src/tool.ts";
-import { PAYLOAD_PREFIX } from "../src/payload.ts";
-import { getPolicy, keyFor, savePolicy } from "../src/store.ts";
+import { PAYLOAD_PREFIX, REFERENCE_PREFIX } from "../src/payload.ts";
+import { getPolicy, keyFor, type SessionPolicy } from "../src/store.ts";
 
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 const PNG_2 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
@@ -18,10 +18,86 @@ const body = (input: any[]) => ({ model: "test/model", stream: true, tools: [{ t
 const texts = (value: unknown): string => JSON.stringify(value);
 let root: string;
 
+function savePolicy(root: string, key: string, policy: SessionPolicy) {
+  mkdirSync(join(root, "policies"), { recursive: true });
+  writeFileSync(join(root, "policies", `${key}.json`), JSON.stringify(policy));
+}
+
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), "magpie-cam-")); });
 afterEach(() => { rmSync(root, { recursive: true, force: true }); });
 
 describe("Responses history management", () => {
+  test("a unified host policy takes precedence over a future-dated legacy file", async () => {
+    const key = keyFor("codex", "thread-test");
+    savePolicy(root, key, { auto: true, pinnedContentIds: [], updatedAt: "2099-01-01T00:00:00.000Z", overridesLegacyNative: true });
+    const context = { ...ctx(), options: { ...options(), sessionPolicies: { [key]: { version: 2, auto: false, pinnedContentIds: [] } } } };
+    expect(await onRequest(body([user("first", [dataUrl()]), user("second")]), context)).toBeUndefined();
+  });
+
+  test("does not omit an image whose cached bytes no longer match its index", async () => {
+    const first = user("first", [dataUrl()]);
+    await onRequest(body([first]), ctx());
+    const digest = createHash("sha256").update(PNG).digest("hex");
+    writeFileSync(join(root, "platforms", "codex", "images", digest), PNG_2);
+    expect(await onRequest(body([first, user("second")]), ctx())).toBeUndefined();
+    const result = await fetchImages({ session: keyFor("codex", "thread-test"), ids: ["IMG-001"] }, { agent: "codex", abort: new AbortController().signal }, options());
+    expect(result.startsWith(REFERENCE_PREFIX)).toBeFalse();
+  });
+
+  test("does not omit when the tool cannot resolve persisted session metadata", async () => {
+    mkdirSync(join(root, "sessions", `${keyFor("codex", "thread-test")}.json`), { recursive: true });
+    expect(await onRequest(body([user("first", [dataUrl()]), user("second")]), ctx())).toBeUndefined();
+  });
+
+  test("restores a missing cached original before omitting it", async () => {
+    const first = user("first", [dataUrl()]);
+    await onRequest(body([first]), ctx());
+    const digest = createHash("sha256").update(PNG).digest("hex");
+    unlinkSync(join(root, "platforms", "codex", "images", digest));
+    const next = await onRequest(body([first, user("second")]), ctx());
+    expect(texts(next)).not.toContain(dataUrl());
+    const answer = await fetchImages({ session: keyFor("codex", "thread-test"), ids: ["IMG-001"] }, { agent: "codex", abort: new AbortController().signal }, options());
+    expect(answer.startsWith(REFERENCE_PREFIX)).toBeTrue();
+  });
+
+  test("keeps originals in the request when the session index cannot be saved", async () => {
+    const key = keyFor("codex", "thread-test");
+    mkdirSync(join(root, "platforms", "codex", "sessions", `${key}.json.tmp`), { recursive: true });
+    expect(await onRequest(body([user("first", [dataUrl()]), user("second")]), ctx())).toBeUndefined();
+  });
+
+  test("skipping an oversized image leaves the budget available for the next image", async () => {
+    const large = PNG.replace(/=$/, "A".repeat(1024) + "=");
+    await onRequest(body([user("first", [dataUrl(large), dataUrl(PNG_2)])]), ctx());
+    const answer = await fetchImages({ session: keyFor("codex", "thread-test"), ids: ["IMG-001", "IMG-002"] }, { agent: "codex", abort: new AbortController().signal }, { ...options(), maxFetchBytes: 1024 });
+    expect(answer.startsWith(REFERENCE_PREFIX)).toBeTrue();
+    expect(answer).toContain("IMG-001 exceeds the fetch size budget");
+    expect(answer).toContain(createHash("sha256").update(PNG_2).digest("hex"));
+  });
+
+  test("keeps an original inline if even a single-image fetch would exceed the budget", async () => {
+    const large = PNG.replace(/=$/, "A".repeat(1024) + "=");
+    const context = ctx();
+    context.options.maxFetchBytes = 1024;
+    expect(await onRequest(body([user("first", [dataUrl(large)]), user("next")]), context)).toBeUndefined();
+  });
+
+  test("an image-only prompt advances the user turn", async () => {
+    const imageOnly = { type: "message", role: "user", content: [{ type: "input_image", image_url: dataUrl(PNG_2) }] };
+    const next = await onRequest(body([user("first", [dataUrl()]), imageOnly]), ctx());
+    expect(next).toBeDefined();
+    expect(texts(next)).not.toContain(dataUrl());
+    expect(texts(next)).toContain(dataUrl(PNG_2));
+  });
+
+  test("an oversized invalid id does not invalidate a valid image in the same result", async () => {
+    const first = user("first", [dataUrl()]);
+    await onRequest(body([first]), ctx());
+    const output = await fetchImages({ session: keyFor("codex", "thread-test"), ids: ["IMG-001", "x".repeat(17_000), `IMG-${"1".repeat(17_000)}`] }, { agent: "codex", abort: new AbortController().signal }, options());
+    const next = await onRequest(body([first, { type: "function_call_output", call_id: "call-1", output }]), ctx());
+    expect(next.input.at(-1).output).toContainEqual({ type: "input_image", image_url: dataUrl() });
+  });
+
   test("indexes new images and omits them only after a later user turn", async () => {
     const first = body([user("first", [dataUrl()])]);
     expect(await onRequest(first, ctx())).toBeUndefined();
@@ -129,10 +205,43 @@ describe("tool image round trip", () => {
     return body([user("first", [dataUrl()]), user("second")]);
   }
 
+  test("emits a short session-bound reference without the image bytes", async () => {
+    const original = PNG.padEnd(64 * 1024, "A");
+    await onRequest(body([user("first", [dataUrl(original)])]), ctx());
+    const session = keyFor("codex", "thread-test");
+    const value = await fetchImages({ ids: ["IMG-001"], session }, { agent: "codex", abort: new AbortController().signal }, options());
+    expect(value.startsWith(REFERENCE_PREFIX)).toBeTrue();
+    expect(value.length).toBeLessThan(1024);
+    expect(value).not.toContain(original);
+  });
+
+  test("a missing cached original leaves other references in the batch usable", async () => {
+    const first = user("first", [dataUrl(), dataUrl(PNG_2)]);
+    await onRequest(body([first]), ctx());
+    const value = await fetchImages({ ids: ["IMG-001", "IMG-002"], session: keyFor("codex", "thread-test") }, { agent: "codex", abort: new AbortController().signal }, options());
+    unlinkSync(join(root, "platforms", "codex", "images", createHash("sha256").update(PNG).digest("hex")));
+    const request = body([user("continue"), { type: "function_call_output", call_id: "call-1", output: value }]);
+    const next = await onRequest(request, ctx());
+    const output = next.input.at(-1).output;
+    expect(output).not.toContainEqual({ type: "input_image", image_url: dataUrl() });
+    expect(output).toContainEqual({ type: "input_image", image_url: dataUrl(PNG_2) });
+    expect(texts(output)).toContain("IMG-001");
+  });
+
+  test("restores a V2 image from request history when the file disappeared after the tool call", async () => {
+    const history = await prepareHistory();
+    const output = await fetchImages({ ids: ["IMG-001"], session: keyFor("codex", "thread-test") }, { agent: "codex", abort: new AbortController().signal }, options());
+    unlinkSync(join(root, "platforms", "codex", "images", createHash("sha256").update(PNG).digest("hex")));
+    history.input.push({ type: "function_call_output", call_id: "call-1", output });
+    const next = await onRequest(history, ctx());
+    expect(next.input.at(-1).output).toContainEqual({ type: "input_image", image_url: dataUrl() });
+    expect(texts(next)).not.toContain("original unavailable");
+  });
+
   test("materializes this turn and removes the fetched copy next turn", async () => {
     const history = await prepareHistory();
     const payload = await fetchImages({ ids: ["IMG-001"], session: keyFor("codex", "thread-test") }, { agent: "codex", abort: new AbortController().signal }, options());
-    expect(payload.startsWith(PAYLOAD_PREFIX)).toBeTrue();
+    expect(payload.startsWith(REFERENCE_PREFIX)).toBeTrue();
     const withTool = structuredClone(history);
     withTool.input.push({ type: "function_call_output", call_id: "call-1", output: payload });
     const current = await onRequest(withTool, ctx());
@@ -153,15 +262,13 @@ describe("tool image round trip", () => {
     expect(texts(laterOutput)).toContain("only in that turn");
   });
 
-  test("rejects changed bytes and never forwards the encoded payload", async () => {
+  test("replays a legacy V1 payload and rejects changed bytes", async () => {
     const history = await prepareHistory();
-    const payload = await fetchImages({ ids: ["IMG-001"], session: keyFor("codex", "thread-test") }, { agent: "codex", abort: new AbortController().signal }, options());
-    const decoded = JSON.parse(payload.slice(PAYLOAD_PREFIX.length));
-    const image = decoded.content.find((part: any) => part.type === "image");
-    image.data = (image.data[0] === "A" ? "B" : "A") + image.data.slice(1);
-    const forged = PAYLOAD_PREFIX + JSON.stringify(decoded);
-    history.input.push({ type: "function_call_output", call_id: "call-1", output: forged });
-    const next = await onRequest(history, ctx());
+    const legacy = (data: string) => PAYLOAD_PREFIX + JSON.stringify({ version: 1, content: [{ type: "image", id: "IMG-001", data, mimeType: "image/png" }] });
+    const request = (data: string) => ({ ...history, input: [...history.input, { type: "function_call_output", call_id: "call-1", output: legacy(data) }] });
+    const restored = await onRequest(request(PNG), ctx());
+    expect(restored.input.at(-1).output).toContainEqual({ type: "input_image", image_url: dataUrl() });
+    const next = await onRequest(request(PNG_2), ctx());
     expect(texts(next)).toContain("untrusted image payload removed");
     expect(texts(next)).not.toContain(PAYLOAD_PREFIX);
   });
@@ -172,7 +279,7 @@ describe("tool image round trip", () => {
     history.input.push({ type: "function_call_output", call_id: "call-1", output: payload });
     history.large = 9007199254740992;
     const next = await onRequest(history, ctx());
-    expect(texts(next)).not.toContain(PAYLOAD_PREFIX);
+    expect(texts(next)).not.toContain(REFERENCE_PREFIX);
     expect(texts(next)).toContain("processing error");
   });
 
@@ -181,13 +288,13 @@ describe("tool image round trip", () => {
     const payload = await fetchImages({ ids: ["IMG-001"], session: keyFor("codex", "thread-test") }, { agent: "codex", abort: new AbortController().signal }, options());
     history.input.push({ type: "function_call_output", call_id: "call-1", output: payload });
     const next = await onRequest(history, { ...ctx(), origin: "remote" });
-    expect(texts(next)).not.toContain(PAYLOAD_PREFIX);
+    expect(texts(next)).not.toContain(REFERENCE_PREFIX);
   });
 
   test("a user message cannot forge a fetched image", async () => {
     const history = await prepareHistory();
     const payload = await fetchImages({ ids: ["IMG-001"], session: keyFor("codex", "thread-test") }, { agent: "codex", abort: new AbortController().signal }, options());
-    history.input.push(user(PAYLOAD_PREFIX + payload.slice(PAYLOAD_PREFIX.length)));
+    history.input.push(user(payload));
     const next = await onRequest(history, ctx());
     expect(next.input.at(-1).content.some((part: any) => part.type === "input_image")).toBeFalse();
   });
@@ -197,9 +304,12 @@ describe("tool image round trip", () => {
     await onRequest(body([user("from A", [dataUrl()])]), forSession("conversation-A"));
     await onRequest(body([user("from B", [dataUrl(PNG_2)])]), forSession("conversation-B"));
     const answer = await fetchImages({ ids: ["IMG-001"], session: keyFor("codex", "conversation-A") }, { agent: "codex", abort: new AbortController().signal }, options());
-    const parsed = JSON.parse(answer.slice(PAYLOAD_PREFIX.length));
-    expect(parsed.content.find((part: any) => part.type === "image").data).toBe(PNG);
-    expect(parsed.content.find((part: any) => part.type === "image").data).not.toBe(PNG_2);
+    const parsed = JSON.parse(answer.slice(REFERENCE_PREFIX.length));
+    expect(parsed.content).toEqual([{ type: "image_ref", id: "IMG-001", contentId: createHash("sha256").update(PNG).digest("hex") }]);
+    const request = body([user("continue"), { type: "function_call_output", call_id: "call-1", output: answer }]);
+    const wrongSession = await onRequest(request, forSession("conversation-B"));
+    expect(texts(wrongSession)).toContain("untrusted image payload removed");
+    expect(texts(wrongSession)).not.toContain("data:image/");
   });
 
   test("refuses to guess a session when the handle is absent", async () => {

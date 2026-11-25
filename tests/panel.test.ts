@@ -3,8 +3,12 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
+import { createServer } from "node:http";
+import { createHash } from "node:crypto";
+import { createContext, runInContext } from "node:vm";
 import { onRequest } from "../src/hooks.ts";
 import { createPanelServer, PageService } from "../src/panel-service.ts";
+import { writeLiveData } from "../src/live-data.ts";
 import { getPolicyWithOptions, keyFor, recordSession } from "../src/store.ts";
 
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
@@ -32,20 +36,130 @@ const panelKey = keyFor("codex", "panel-thread");
 const nativePolicies: Record<string, { auto: boolean; updatedAt?: string }> = {};
 
 describe("panel service", () => {
-  test("web reads a native policy and its next save becomes effective", async () => {
+  test("shows attachments but prevents policy edits if the host cannot supply options", async () => {
+    const source = readFileSync(new URL("../panel/app.js", import.meta.url), "utf8");
+    const nodes: Record<string, any> = {};
+    const element = () => ({ dataset: {}, append() {}, replaceChildren() {}, setAttribute() {}, textContent: "" });
+    const buttons: any[] = [];
+    let hostAvailable = false;
+    let writes = 0;
+    const environment = createContext({
+      panelKey, location: {}, setTimeout, clearTimeout,
+      document: {
+        getElementById: (id: string) => (nodes[id] ??= element()),
+        querySelectorAll: () => [],
+        createElement: (tag: string) => {
+          const node = element();
+          if (tag === "button") buttons.push(node);
+          return node;
+        },
+      },
+      IntersectionObserver: class { observe() {} disconnect() {} },
+      magpie: {
+        ready: new Promise(() => {}),
+        options: {
+          get: async () => {
+            if (!hostAvailable) throw new Error("Host unavailable");
+            return { auto: false };
+          },
+          set: async () => { writes++; },
+        },
+      },
+    });
+    runInContext(`${source}
+      live.details[panelKey] = {
+        session: { key: panelKey, platform: "codex" },
+        legacyPolicy: { pinnedContentIds: [] },
+        images: [{ id: "IMG-001", contentId: "a".repeat(64), stored: true }]
+      };
+    `, environment);
+    await runInContext("loadDetail(panelKey)", environment);
+    expect(nodes.count.textContent).toBe(1);
+    expect(nodes.auto.disabled).toBeTrue();
+    expect(nodes.auto.indeterminate).toBeTrue();
+    expect(buttons.at(-1).disabled).toBeTrue();
+    await runInContext('$("auto").onchange({ target: { checked: true } })', environment);
+    expect(writes).toBe(0);
+    hostAvailable = true;
+    await runInContext("loadDetail(panelKey)", environment);
+    expect(nodes.auto.disabled).toBeFalse();
+    expect(nodes.auto.checked).toBeFalse();
+  });
+
+  test("native and web page scripts save through the same host options", async () => {
+    const source = readFileSync(new URL("../panel/app.js", import.meta.url), "utf8");
+    const previouslyPinned = "a".repeat(64);
+    const newPin = "b".repeat(64);
+    let options: Record<string, any> = { language: "en", sessionPolicies: { other: { auto: false }, [panelKey]: { version: 2, auto: true, pinnedContentIds: [previouslyPinned] } } };
+    for (const native of [true, false]) {
+      const elements: Record<string, Record<string, unknown>> = {};
+      const environment = createContext({
+        native, newPin, panelKey, setTimeout, clearTimeout,
+        document: { getElementById: (id: string) => (elements[id] ??= {}), querySelectorAll: () => [] },
+        magpie: {
+          ready: new Promise(() => {}),
+          options: {
+            get: async () => structuredClone(options),
+            set: async (next: typeof options) => (options = structuredClone(next)),
+          },
+        },
+        fetch: () => { throw new Error("Policy saves must not use the HTTP service"); },
+      });
+      await runInContext(`${source}
+        current = { session: { key: panelKey }, policy: { auto: true, pinnedContentIds: [] }, legacyPolicy: { auto: true, pinnedContentIds: [] } };
+        renderDetail = () => {};
+        toast = (message, error) => { if (error) throw new Error(message); };
+        native ? $("auto").onchange({ target: { checked: false } }) : togglePin(newPin);
+      `, environment);
+    }
+    expect(options.language).toBe("en");
+    expect(options.sessionPolicies.other).toEqual({ auto: false });
+    expect(options.sessionPolicies[panelKey]).toEqual({ version: 2, auto: false, pinnedContentIds: [previouslyPinned, newPin] });
+    expect(getPolicyWithOptions(root, panelKey, true, options)).toEqual({ auto: false, pinnedContentIds: [previouslyPinned, newPin] });
+  });
+
+  test("web exposes the legacy fallback and directs writes to host options", async () => {
     nativePolicies[panelKey] = { auto: false };
     try {
       const url = `${base}/api/sessions/${panelKey}`;
-      expect((await (await fetch(url)).json()).policy.auto).toBeFalse();
+      const detail = await (await fetch(url)).json();
+      expect(detail.policy.auto).toBeFalse();
+      expect(detail.legacyPolicy.auto).toBeUndefined();
       const saved = await fetch(`${url}/policy`, { method: "PUT", body: JSON.stringify({ auto: true }) });
-      expect(saved.status).toBe(200);
-      expect((await (await fetch(url)).json()).policy.auto).toBeTrue();
-      expect(getPolicyWithOptions(root, panelKey, true, { sessionPolicies: nativePolicies }).auto).toBeTrue();
-      nativePolicies[panelKey] = { auto: false, updatedAt: new Date(Date.now() + 1000).toISOString() };
+      expect(saved.status).toBe(405);
+      expect(getPolicyWithOptions(root, panelKey, true, { sessionPolicies: nativePolicies }).auto).toBeFalse();
       expect((await (await fetch(url)).json()).policy.auto).toBeFalse();
     } finally {
       delete nativePolicies[panelKey];
     }
+  });
+
+  test("the panel uses the current host default unless a legacy file explicitly sets auto", () => {
+    const source = readFileSync(new URL("../panel/app.js", import.meta.url), "utf8");
+    const environment = createContext({
+      panelKey,
+      document: { getElementById: () => ({}) },
+      magpie: { ready: new Promise(() => {}) },
+    });
+    const readAuto = (legacyPolicy: string) => runInContext(`effectivePolicy(
+      { session: { key: panelKey }, policy: { auto: true, pinnedContentIds: [] }, legacyPolicy: ${legacyPolicy} },
+      { auto: false }).auto`, environment);
+    runInContext(source, environment);
+    expect(readAuto("{ pinnedContentIds: [] }")).toBeFalse();
+    expect(readAuto("{ auto: true, pinnedContentIds: [] }")).toBeTrue();
+    expect(readAuto("undefined")).toBeFalse();
+  });
+
+  test("publishes the last session recorded inside the throttle window", async () => {
+    const snapshot = join(process.env.MAGPIE_CAM_PANEL_DIR!, "live.js");
+    writeLiveData(root, true);
+    const key = keyFor("codex", "trailing-session");
+    recordSession(root, { key, named: "trailing-session", platform: "codex", protocol: "responses", model: "test" });
+    writeLiveData(root);
+    expect(readFileSync(snapshot, "utf8")).not.toContain(key);
+    const deadline = Date.now() + 2200;
+    while (!readFileSync(snapshot, "utf8").includes(key) && Date.now() < deadline) await Bun.sleep(50);
+    expect(readFileSync(snapshot, "utf8")).toContain(key);
   });
 
   test("serves the page, session detail, image and policy", async () => {
@@ -58,11 +172,7 @@ describe("panel service", () => {
     const detail = await (await fetch(base + "/api/sessions/" + key)).json();
     expect(detail.images).toHaveLength(1);
     expect(detail.images[0].id).toBe("IMG-001");
-    const changed = await fetch(base + `/api/sessions/${key}/policy`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ auto: false, pinnedContentIds: [detail.images[0].contentId, "not-a-digest"] }) });
-    expect(changed.status).toBe(200);
-    const updated = await (await fetch(base + "/api/sessions/" + key)).json();
-    expect(updated.policy.auto).toBeFalse();
-    expect(updated.policy.pinnedContentIds).toEqual([detail.images[0].contentId]);
+    expect(detail.policy.auto).toBeTrue();
     const image = await (await fetch(base + `/api/sessions/${key}/images/IMG-001`)).json();
     expect(image.dataUrl).toBe(`data:image/png;base64,${PNG}`);
   });
@@ -77,9 +187,25 @@ describe("panel service", () => {
     expect(Number(response.headers.get("content-length"))).toBe(Buffer.byteLength(JSON.stringify(data)));
   });
 
-  test("reuses an existing healthy service during plugin reload", async () => {
+  test("reuses the listener with the latest options during plugin reload", async () => {
     const port = (server!.address() as AddressInfo).port;
-    await expect(PageService({}, { dataDir: root, panelPort: port })).resolves.toEqual({});
+    const options = { dataDir: root, panelPort: port, auto: false };
+    await expect(PageService({}, options)).resolves.toEqual({});
+    const url = `${base}/api/sessions/${panelKey}`;
+    expect((await (await fetch(url)).json()).policy.auto).toBeFalse();
+    await PageService({}, { ...options, auto: true });
+    expect((await (await fetch(url)).json()).policy.auto).toBeTrue();
+  });
+
+  test("rejects a listener whose options it cannot update", async () => {
+    const occupied = createServer((_request, response) => response.end('{"service":"magpie-cam"}'));
+    await new Promise<void>((resolve) => occupied.listen(0, "127.0.0.1", resolve));
+    try {
+      const panelPort = (occupied.address() as AddressInfo).port;
+      await expect(PageService({}, { dataDir: root, panelPort })).rejects.toThrow(/EADDRINUSE|in use/i);
+    } finally {
+      await new Promise<void>((resolve) => occupied.close(() => resolve()));
+    }
   });
 
   test("publishes native live data and static thumbnails", async () => {
@@ -87,11 +213,33 @@ describe("panel service", () => {
     const key = sessions.sessions[0].key;
     const dir = process.env.MAGPIE_CAM_PANEL_DIR!;
     expect(existsSync(join(dir, "live.js"))).toBeTrue();
-    expect(readFileSync(join(dir, "live.js"), "utf8")).toContain(key);
-    expect(existsSync(join(dir, "images", key, "IMG-001.png"))).toBeTrue();
+    const snapshot = readFileSync(join(dir, "live.js"), "utf8");
+    const detail = JSON.parse(snapshot.slice(snapshot.indexOf("=") + 1).trimEnd().slice(0, -1)).details[key];
+    expect(detail.legacyPolicy).toEqual({ pinnedContentIds: [] });
+    expect(detail).not.toHaveProperty("policy");
+    expect(detail.images[0]).not.toHaveProperty("pinned");
+    const digest = createHash("sha256").update(PNG).digest("hex");
+    expect(existsSync(join(dir, "images", key, `IMG-001-${digest}.png`))).toBeTrue();
     const app = await fetch(base + "/app.js");
     expect(app.status).toBe(200);
-    expect(await app.text()).toContain("staticMode");
+    expect(await app.text()).toContain("loadLive");
+  });
+
+  test("publishes a different thumbnail when a data directory reuses an image id", async () => {
+    const secondRoot = mkdtempSync(join(tmpdir(), "magpie-cam-panel-other-"));
+    try {
+      const otherImage = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+      writeLiveData(root, true);
+      await onRequest({ input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hello" }, { type: "input_image", image_url: `data:image/png;base64,${otherImage}` }] }] }, {
+        protocol: "responses", path: "/responses", origin: "local", agent: "codex", session: "panel-thread", options: { dataDir: secondRoot },
+      });
+      writeLiveData(secondRoot, true);
+      const digest = createHash("sha256").update(otherImage).digest("hex");
+      const thumbnail = join(process.env.MAGPIE_CAM_PANEL_DIR!, "images", panelKey, `IMG-001-${digest}.png`);
+      expect(readFileSync(thumbnail).toString("base64")).toBe(otherImage);
+    } finally {
+      rmSync(secondRoot, { recursive: true, force: true });
+    }
   });
 
   test("rejects DNS-rebinding hosts and cross-site browser requests", async () => {

@@ -1,7 +1,5 @@
 import { fetchImages, type ToolArgs, type ToolContext } from "./tool.ts";
 
-export { PageService } from "./panel-service.ts";
-
 export const CamPlugin = async (_input: unknown, options: Record<string, unknown> = {}) => ({
   tool: {
     cam_view_image: {

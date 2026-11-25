@@ -1,8 +1,8 @@
 import { openRequestIndex, seenImage } from "../vendor/cam/core/request-index.ts";
 import { SESSION_KEY } from "../vendor/cam/core/selection.ts";
-import { fetchedLabel } from "../vendor/cam/core/words.ts";
 import { resolveOptions } from "./options.ts";
-import { encodePayload, type PayloadContent } from "./payload.ts";
+import { encodeReferences, type ReferenceContent } from "./payload.ts";
+import { fitsImageBudget, IMAGE_ID, verifiedContentId, type FetchImage } from "./retrieval.ts";
 import { getPolicyWithOptions, getSession } from "./store.ts";
 
 export type ToolArgs = { ids?: unknown; session?: unknown };
@@ -27,12 +27,12 @@ export async function fetchImages(args: ToolArgs, ctx: ToolContext, rawOptions: 
   if (!ids.length) return english ? "Pass one or more image ids, for example [\"IMG-001\"]." : "请传入至少一个图片编号，例如 [\"IMG-001\"]。";
   if (ids.length > options.maxFetchImages) return english ? `Fetch at most ${options.maxFetchImages} images at once.` : `每次最多取回 ${options.maxFetchImages} 张图片。`;
   const index = openRequestIndex(platform, session, options.dataDir);
-  const content: PayloadContent[] = [];
+  const content: ReferenceContent[] = [];
   let found = 0;
   let bytes = 0;
   for (const id of ids) {
-    if (!/^IMG-\d{3,}$/.test(id)) {
-      content.push({ type: "text", text: english ? `${id}: invalid image id.` : `${id}：图片编号无效。` });
+    if (!IMAGE_ID.test(id)) {
+      content.push({ type: "text", text: english ? "Invalid image id. Use a value such as IMG-001." : "图片编号无效，请使用 IMG-001 这样的编号。" });
       continue;
     }
     const image = seenImage(index, id, options.dataDir);
@@ -44,19 +44,23 @@ export async function fetchImages(args: ToolArgs, ctx: ToolContext, rawOptions: 
       content.push({ type: "text", text: english ? `${id} is no longer available locally; upload it again.` : `${id} 的原图已不在本地，请重新上传。` });
       continue;
     }
-    bytes += image.data.length;
-    if (bytes > options.maxFetchBytes) {
+    const remaining = options.maxFetchBytes - bytes;
+    if (!fitsImageBudget(image.data, remaining)) {
       content.push({ type: "text", text: english ? `${id} exceeds the fetch size budget; request fewer images.` : `${id} 超出本次取图大小限制，请减少一次取回的图片数量。` });
       continue;
     }
-    content.push(
-      { type: "text", text: fetchedLabel({ id, name: null, label: null, kind: image.seen.kind, turn: image.seen.turn, width: image.seen.width, height: image.seen.height }, options.language) },
-      { type: "image", id, data: image.data, mimeType: image.seen.mime ?? "image/png" },
-    );
+    const part: FetchImage = { type: "image", id, data: image.data, mimeType: image.seen.mime ?? "image/png" };
+    const contentId = verifiedContentId(index, part, remaining);
+    if (!contentId) {
+      content.push({ type: "text", text: english ? `${id} is unavailable or invalid locally; upload it again.` : `${id} 的原图不可用或已损坏，请重新上传。` });
+      continue;
+    }
+    bytes += image.data.length;
+    content.push({ type: "image_ref", id, contentId });
     found++;
   }
   if (!found) return content.map((part) => part.type === "text" ? part.text : "").filter(Boolean).join("\n");
   // Magpie's tool transport is text-only. The request hook validates this
   // payload against the session index and materializes it on the next turn.
-  return encodePayload(content);
+  return encodeReferences(session, options.language, content);
 }

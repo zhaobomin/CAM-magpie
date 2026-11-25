@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Lang } from "../vendor/cam/core/lang.ts";
+import { MAX_FETCH_CHARS } from "./retrieval.ts";
 
 export type CamOptions = {
   dataDir: string;
@@ -29,7 +30,7 @@ export function resolveOptions(raw: Record<string, unknown> = {}, env: NodeJS.Pr
     allowRemote: raw.allowRemote === true,
     gatewayTimeoutMs: integer(raw.gatewayTimeoutMs, 10_000, 100, 30_000),
     maxFetchImages: integer(raw.maxFetchImages, 4, 1, 8),
-    maxFetchBytes: integer(raw.maxFetchBytes, 12 * 1024 * 1024, 1024, 32 * 1024 * 1024),
+    maxFetchBytes: integer(raw.maxFetchBytes, 12 * 1024 * 1024, 1024, MAX_FETCH_CHARS),
     panelPort: integer(raw.panelPort, 17_893, 1024, 65_535),
   };
 }

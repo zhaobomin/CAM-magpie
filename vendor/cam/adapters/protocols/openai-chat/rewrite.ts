@@ -19,6 +19,7 @@ const DATA_URL = /^data:([^;,]+);base64,(.*)$/s;
 const urlOf = (part: Json): string | null => (typeof part?.image_url === "string" ? part.image_url : typeof part?.image_url?.url === "string" ? part.image_url.url : null);
 const textOf = (part: Json): string => (part?.type === "text" && typeof part.text === "string" ? part.text : "");
 const hasOwnText = (message: Json) => (typeof message?.content === "string" ? message.content.trim() !== "" : Array.isArray(message?.content) && message.content.some((part: Json) => textOf(part).trim() !== ""));
+const isUserPrompt = (message: Json) => message?.role === "user" && (hasOwnText(message) || (Array.isArray(message.content) && message.content.some((part: Json) => part?.type === "image_url")));
 
 // turns: how many prompts the request has (the current turn). first: the first prompt's text.
 export function chatImages(messages: Json[]): { images: ChatImage[]; turns: number; first: string } {
@@ -26,16 +27,16 @@ export function chatImages(messages: Json[]): { images: ChatImage[]; turns: numb
   let turns = 0;
   let first = "";
   messages.forEach((message, msg) => {
-    if (message?.role === "user" && hasOwnText(message)) {
+    if (isUserPrompt(message)) {
       turns++;
-      if (turns === 1) first = typeof message.content === "string" ? message.content : message.content.map(textOf).join("\n");
+      if (!first && hasOwnText(message)) first = typeof message.content === "string" ? message.content : message.content.map(textOf).join("\n");
     }
     if ((message?.role !== "user" && message?.role !== "tool") || !Array.isArray(message.content)) return;
     message.content.forEach((part: Json, at: number) => {
       const found = part?.type === "image_url" ? DATA_URL.exec(urlOf(part) ?? "") : null;
       if (!found) return;
       const before = at > 0 ? textOf(message.content[at - 1]) : "";
-      const kind: ImageKind = message.role === "user" && hasOwnText(message) ? "upload" : "tool";
+      const kind: ImageKind = message.role === "user" ? "upload" : "tool";
       images.push({ ...imageDigest(part, found[2], found[1]), key: `m${msg}:p${at}`, kind, name: null, label: null, replaceable: true, msg, part: at, turn: Math.max(turns, 1), fetchedOf: before ? fetchedIdIn(before) : null, data: found[2] });
     });
   });
@@ -63,7 +64,7 @@ export function rewriteChat(
   // The note on omitted images goes first in the message holding the first of them; the feature line note (v0.8), first
   // in the prompt of the turn holding the first image the index knows.
   const noteIn = plan.plain.length ? images[plan.plain[0].slot].msg : null;
-  const prompts = messages.flatMap((message, msg) => (message?.role === "user" && hasOwnText(message) ? [msg] : []));
+  const prompts = messages.flatMap((message, msg) => (isUserPrompt(message) ? [msg] : []));
   const featureIn = plan.first !== null ? prompts[images[plan.first].turn - 1] ?? images[plan.first].msg : null;
   const next = messages.map((message, msg) => {
     const list = edits.get(msg);

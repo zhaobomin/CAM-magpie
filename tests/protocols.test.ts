@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { onRequest } from "../src/hooks.ts";
 import { fetchImages } from "../src/tool.ts";
-import { materializeToolPayloads, PAYLOAD_PREFIX, redactPayloadsEverywhere } from "../src/payload.ts";
+import { materializeToolPayloads, REFERENCE_PREFIX, redactPayloadsEverywhere } from "../src/payload.ts";
 import { keyFor } from "../src/store.ts";
 
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
@@ -48,7 +49,7 @@ describe("tool payload protocol adapters", () => {
   test("mixed tool-output parts cannot smuggle an encoded payload", async () => {
     const result = materializeToolPayloads({ input: [{ type: "custom_tool_call_output", output: [{ type: "input_text", text: "before" }, { type: "input_text", text: await payload() }] }] }, "responses", "codex", keyFor("codex", "shared"), root);
     expect(result.count).toBe(1);
-    expect(JSON.stringify(result.body)).not.toContain(PAYLOAD_PREFIX);
+    expect(JSON.stringify(result.body)).not.toContain(REFERENCE_PREFIX);
     expect(JSON.stringify(result.body)).toContain("split or mixed");
   });
 
@@ -56,7 +57,7 @@ describe("tool payload protocol adapters", () => {
     const value = await payload();
     const result = materializeToolPayloads({ input: [{ type: "function_call_output", output: value }] }, "responses", "codex", null, root);
     expect(result.count).toBe(1);
-    expect(JSON.stringify(result.body)).not.toContain(PAYLOAD_PREFIX);
+    expect(JSON.stringify(result.body)).not.toContain(REFERENCE_PREFIX);
     expect(JSON.stringify(result.body)).toContain("payload removed");
   });
 
@@ -64,12 +65,45 @@ describe("tool payload protocol adapters", () => {
     const value = await payload();
     const result = redactPayloadsEverywhere({ input: [{ output: value }, { text: "ordinary" }] });
     expect(result.count).toBe(1);
-    expect(JSON.stringify(result.value)).not.toContain(PAYLOAD_PREFIX);
+    expect(JSON.stringify(result.value)).not.toContain(REFERENCE_PREFIX);
     expect(JSON.stringify(result.value)).toContain("processing error");
   });
 });
 
 describe("other history protocols", () => {
+  test.each(["responses", "chat", "anthropic"])("%s: an omitted original survives the tool round trip at the budget limit", async (protocol) => {
+    const original = PNG.padEnd(1024, "A");
+    const dataUrl = `data:image/png;base64,${original}`;
+    const image = protocol === "responses" ? { type: "input_image", image_url: dataUrl }
+      : protocol === "chat" ? { type: "image_url", image_url: { url: dataUrl } }
+      : { type: "image", source: { type: "base64", media_type: "image/png", data: original } };
+    const user = (text: string, ...attachments: object[]) => ({
+      ...(protocol === "responses" ? { type: "message" } : {}),
+      role: "user",
+      content: [{ type: protocol === "responses" ? "input_text" : "text", text }, ...attachments],
+    });
+    const history = [user("first", image), user("next")];
+    const request = (items: object[]) => ({ tools: [{ name: "cam_view_image" }], [protocol === "responses" ? "input" : "messages"]: items });
+    const path = protocol === "responses" ? "/responses" : protocol === "chat" ? "/v1/chat/completions" : "/v1/messages";
+    const options = { dataDir: root, maxFetchBytes: 1024 };
+    const context = { protocol, path, options, origin: "local", agent: "codex", session: protocol };
+    const omitted = await onRequest(request(history), context);
+    const marker = /\[Magpie CAM session: ([0-9a-f]+)\]/.exec(JSON.stringify(omitted));
+    expect(marker).not.toBeNull();
+    expect(JSON.stringify(omitted)).not.toContain(original);
+    const output = await fetchImages({ session: marker![1], ids: ["IMG-001"] }, { agent: "codex", abort: new AbortController().signal }, options);
+    const result = protocol === "responses" ? { type: "function_call_output", call_id: "call-1", output }
+      : protocol === "chat" ? { role: "tool", tool_call_id: "call-1", content: output }
+      : { role: "user", content: [{ type: "tool_result", tool_use_id: "call-1", content: output }] };
+    const restored = await onRequest(request([...history, result]), context);
+    expect(JSON.stringify(restored)).toContain(original);
+    expect(JSON.stringify(restored)).not.toContain(REFERENCE_PREFIX);
+    unlinkSync(join(root, "platforms", "codex", "images", createHash("sha256").update(original).digest("hex")));
+    const recovered = JSON.stringify(await onRequest(request([...history, result]), context));
+    expect(recovered.split(original)).toHaveLength(2);
+    expect(recovered).not.toContain("original unavailable");
+  });
+
   test("Chat Completions omits an old image", async () => {
     const context = () => ({ protocol: "chat", path: "/v1/chat/completions", origin: "local", agent: "codex", session: "chat-history", options: { dataDir: root, language: "en" }, report() {} });
     const first = { messages: [{ role: "user", content: [{ type: "text", text: "one" }, { type: "image_url", image_url: { url: `data:image/png;base64,${PNG}` } }] }], tools: [{ name: "cam_view_image" }] };
