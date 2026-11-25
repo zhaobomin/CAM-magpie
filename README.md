@@ -4,6 +4,14 @@
 
 > 已在 Magpie 0.1.4777 上部署，验证了 Codex 请求进入网关、附件索引更新及 MCP V2 短引用。当前版本的真实 Codex 聊天取图闭环仍待完整验收。
 
+## 相关项目
+
+- **Magpie**：[官网](https://usemagpie.ai/) · [官方仓库](https://github.com/yetone/magpie) · [插件文档](https://usemagpie.ai/docs/plugins) · [社区插件仓库](https://github.com/magpie-community/plugins)
+- **Context Attachment Manager（CAM）**：[上游仓库](https://github.com/chipfighter/context-attachment-manager)
+- **OpenAI Codex**：[官方仓库](https://github.com/openai/codex)
+- **Claude Code**：[官方文档](https://code.claude.com/docs/en/overview)
+- **Bun**：[官网](https://bun.sh/)
+
 ## 它解决什么
 
 原版 CAM 作为 Codex 前置代理，需要改写 Codex 的上游地址；Magpie 也管理同一地址，双方会反复接管配置。本插件把附件处理移到 Magpie 内部：
