@@ -170,6 +170,7 @@ export function rewritePlatformRequest(platform: string, path: string, original:
   const out = read.rewrite((image) => ids.get(image.key), leaveOut, (image) => (image.data === null ? null : pixelHashOfData(image, image.data)), { lang, copies, auto: { currentTurn: current }, fetched: (image) => !!image.fetchedOf, formatGeneratedText: policy.formatGeneratedText });
   const { report } = out;
   const summary: Json = { format, auto: automatic, images: report.images, replaced: report.replaced.map(({ key: _key, ...rest }) => rest), sentImageHashes: report.sentContentIds.map((id) => id.slice(0, 16)), ...(report.copies.length ? { copies: report.copies } : {}) };
+  summary.pinned = report.sentContentIds.filter((id) => pinned.has(id)).length;
   if (!report.replaced.length && !report.copies.length) return asIs(summary, session);
   const next = Buffer.from(JSON.stringify(out.body), "utf8");
   const body = encodeBody(next, encoding);

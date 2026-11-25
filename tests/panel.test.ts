@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -10,6 +10,7 @@ import { onRequest } from "../src/hooks.ts";
 import { fetchImages } from "../src/tool.ts";
 import { createPanelServer, PageService } from "../src/panel-service.ts";
 import { writeLiveData } from "../src/live-data.ts";
+import { measureStorage } from "../src/storage-usage.ts";
 import { getPolicyWithOptions, keyFor, recordSession } from "../src/store.ts";
 
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
@@ -37,10 +38,55 @@ const panelKey = keyFor("codex", "panel-thread");
 const nativePolicies: Record<string, { auto: boolean; updatedAt?: string }> = {};
 
 describe("panel service", () => {
+  test("counts stored bytes separately and does not follow symlinks", () => {
+    const cache = join(root, "usage-fixture");
+    const panel = join(cache, "panel");
+    const originals = join(cache, "platforms", "codex", "images");
+    const indexes = join(cache, "platforms", "codex", "sessions");
+    for (const dir of [originals, indexes, join(panel, "images")]) mkdirSync(dir, { recursive: true });
+    writeFileSync(join(originals, "original"), "12345");
+    writeFileSync(join(indexes, "index.json"), "123");
+    writeFileSync(join(panel, "images", "preview.png"), "12");
+    writeFileSync(join(panel, "live.js"), "1234");
+    symlinkSync(originals, join(panel, "images", "external"));
+    expect(measureStorage(cache, panel)).toEqual({ originals: 5, indexes: 3, panel: 6 });
+  });
+
+  test("background snapshots preserve selection, skip unchanged detail, and pause on settings", async () => {
+    const source = readFileSync(new URL("../panel/app.js", import.meta.url), "utf8");
+    const nodes: Record<string, any> = { settings: { hidden: true } };
+    const environment = createContext({
+      location: { hash: "#selected" },
+      document: { getElementById: (id: string) => (nodes[id] ??= {}) },
+      magpie: { ready: new Promise(() => {}) },
+    });
+    const result = await runInContext(source + `
+      (async () => {
+        const selected = { key: "selected", title: "Selected" };
+        const detail = { session: selected, images: [], legacyPolicy: {} };
+        current = detail;
+        const reads = [];
+        const rendered = [];
+        loadLive = async () => { live = { sessions: [{ key: "newest" }, selected], details: { selected: detail } }; };
+        renderSessions = (key) => rendered.push(key);
+        loadDetail = async (key) => reads.push(key);
+        await loadSessions(true);
+        detail.images = [{ id: "IMG-001" }];
+        current = { ...detail, images: [] };
+        await loadSessions(true);
+        $("settings").hidden = false;
+        await loadSessions(true);
+        return { reads, rendered, hash: location.hash };
+      })()
+    `, environment);
+    expect(result).toEqual({ reads: ["selected"], rendered: ["selected"], hash: "#selected" });
+  });
+
   test("selecting a session from settings returns to the session view", async () => {
     const source = readFileSync(new URL("../panel/app.js", import.meta.url), "utf8");
     const nodes: Record<string, any> = {};
     const environment = createContext({
+      location: {},
       document: { getElementById: (id: string) => (nodes[id] ??= { setAttribute() {} }) },
       magpie: { ready: new Promise(() => {}) },
     });
@@ -63,6 +109,7 @@ describe("panel service", () => {
     const nodes: Record<string, any> = {
       "settings-form": { reportValidity: () => true },
       "settings-language": { value: "en" },
+      "settings-codex-mode": { value: "compatible" },
       "settings-image-limit": { valueAsNumber: 2 },
       "settings-size-limit": { valueAsNumber: 2048 },
     };
@@ -80,7 +127,7 @@ describe("panel service", () => {
       setTimeout, clearTimeout,
     });
     await runInContext(source + "\nsaveSettings({ preventDefault() {} })", environment);
-    expect(writes).toEqual([{ ...original, agentAuto: { other: false, opencode: false }, language: "en", maxFetchImages: 2, maxFetchBytes: 2048 }]);
+    expect(writes).toEqual([{ ...original, agentAuto: { other: false, opencode: false }, codexMode: "compatible", language: "en", maxFetchImages: 2, maxFetchBytes: 2048 }]);
     const user = (text: string, data?: string) => ({ type: "message", role: "user", content: [
       { type: "input_text", text },
       ...(data ? [{ type: "input_image", image_url: `data:image/png;base64,${data}` }] : []),
@@ -99,7 +146,14 @@ describe("panel service", () => {
   test("shows attachments but prevents policy edits if the host cannot supply options", async () => {
     const source = readFileSync(new URL("../panel/app.js", import.meta.url), "utf8");
     const nodes: Record<string, any> = {};
-    const element = () => ({ dataset: {}, append() {}, replaceChildren() {}, setAttribute() {}, textContent: "" });
+    const element = () => ({
+      dataset: {}, children: [] as unknown[], append() {}, setAttribute() {}, textContent: "",
+      replaceChildren() { this.children.length = 0; },
+      insertBefore(node: unknown, before: unknown) {
+        const index = this.children.indexOf(before);
+        this.children.splice(index < 0 ? this.children.length : index, 0, node);
+      },
+    });
     const buttons: any[] = [];
     let hostAvailable = false;
     let writes = 0;
@@ -144,6 +198,13 @@ describe("panel service", () => {
     await runInContext("loadDetail(panelKey)", environment);
     expect(nodes.auto.disabled).toBeFalse();
     expect(nodes.auto.checked).toBeFalse();
+    const firstCard = nodes.grid.children[0];
+    await runInContext(`
+      current.images = [...current.images, { id: "IMG-002", contentId: "b".repeat(64), stored: true }];
+      renderDetail();
+    `, environment);
+    expect(nodes.grid.children).toHaveLength(2);
+    expect(nodes.grid.children[0]).toBe(firstCard);
   });
 
   test("native and web page scripts save through the same host options", async () => {
