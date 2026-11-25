@@ -9,6 +9,7 @@
   "repository": "github:zhaobomin/CAM-magpie",
   "files": [
     "src/",
+    "scripts/configure-agents.js",
     "vendor/cam/",
     "panel/app.js",
     "panel/index.html",
@@ -37,6 +38,7 @@
     }
   },
   "scripts": {
+    "configure:agents": "bun scripts/configure-agents.js",
     "test": "bun test tests/*.test.ts",
     "check": "bun test tests/*.test.ts",
     "build": "bun build src/index.ts src/hooks.ts --target bun --outdir dist"

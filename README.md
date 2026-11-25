@@ -115,11 +115,23 @@ bun build src/index.ts src/hooks.ts --target bun --outdir /tmp/magpie-cam-build
 
 ## 安装与重载
 
-从 GitHub 安装后，在 Magpie 的 Library → MCP 中将 CAM 工具分配给 Codex：
+先从 GitHub 安装插件：
 
 ```bash
 magpie plugin add github:zhaobomin/CAM-magpie
 ```
+
+然后在 **Magpie → Library → MCP** 中找到 CAM 服务，同时勾选 **Codex** 和 **Claude Code**。两个客户端的模型请求也需要经过 Magpie。
+
+如果已克隆本仓库，可以在仓库目录运行：
+
+```bash
+bun run configure:agents
+```
+
+该命令默认配置 GitHub 安装生成的 `cam` 服务，启用 Codex 和 Claude Code，同时保留已经分配的其他客户端。如果服务名不同，请传入 Library 中的实际名称，例如 `bun run configure:agents CAM-magpie`。普通安装不会自动修改客户端配置。
+
+配置后，在 Claude Code 新开会话，通过 `/mcp` 确认 CAM 服务已连接。Codex 也可在工具列表中确认 `cam_view_image` 是否可用。
 
 本地目录安装时，Magpie 可能把工具命名为 `CAM-magpie_cam_view_image`；hub 和其他安装方式还会产生不同命名空间，插件会按实际声明动态适配。修改源码后使用 `magpie plugin off <路径>` 再 `on` 重载。
 
